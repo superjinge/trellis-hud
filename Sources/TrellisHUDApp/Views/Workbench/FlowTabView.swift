@@ -293,11 +293,10 @@ struct FlowTabView: View {
         }
     }
 
-    // MARK: - Git & Spec Governance Card (Precomputed O(1) Lookup)
+    // MARK: - Git Changes & Specs Card (Precomputed O(1) Lookup)
 
     private func gitAndSpecCard(l10n: L10n) -> some View {
         let git = store.gitStatus
-        let uncoveredCount = store.uncoveredModifiedFiles.count
         let specsByModifiedFile: [String: [SpecDocument]] = {
             var map: [String: [SpecDocument]] = [:]
             for spec in store.specs {
@@ -309,7 +308,7 @@ struct FlowTabView: View {
         }()
 
         return WorkbenchCard(
-            title: l10n.t("Git & Spec Governance", "Git 与规范治理"),
+            title: l10n.t("Git Changes & Specs", "Git 改动与关联规范"),
             systemImage: "arrow.triangle.branch"
         ) {
             HStack(spacing: 6) {
@@ -341,30 +340,6 @@ struct FlowTabView: View {
             }
         } content: {
             if let git {
-                if uncoveredCount > 0 {
-                    HStack(spacing: 6) {
-                        Image(systemName: "exclamationmark.shield.fill")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.orange)
-                        Text(l10n.t(
-                            "\(uncoveredCount) modified \(uncoveredCount == 1 ? "file has" : "files have") zero .trellis/spec/ coverage",
-                            "\(uncoveredCount) 个改动文件缺少 .trellis/spec/ 规范覆盖"
-                        ))
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.primary.opacity(0.92))
-                        Spacer()
-                        Button(l10n.t("Inspect Specs", "查看规范")) {
-                            store.docsSubMode = .projectSpecs
-                            store.selectedTab = .docsSpecs
-                        }
-                        .font(.system(size: 10.5, weight: .medium))
-                        .buttonStyle(.link)
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
-                    .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
-                }
-
                 if git.changes.isEmpty {
                     Text(l10n.t("Working tree is clean. All changes committed.", "工作区干净，所有改动均已提交。"))
                         .font(.system(size: 11.5))
@@ -388,9 +363,7 @@ struct FlowTabView: View {
 
                                 Spacer(minLength: 6)
 
-                                if matchedSpecs.isEmpty {
-                                    StatusPill(text: l10n.t("No spec", "无规范"), color: .orange)
-                                } else {
+                                if !matchedSpecs.isEmpty {
                                     HStack(spacing: 4) {
                                         ForEach(matchedSpecs.prefix(2)) { spec in
                                             Button {
@@ -422,8 +395,8 @@ struct FlowTabView: View {
                 }
             } else {
                 Text(l10n.t(
-                    "Select a Git repository to inspect branch state and .trellis/spec/ coverage.",
-                    "选择 Git 仓库以查看分支状态与 .trellis/spec/ 覆盖情况。"
+                    "Select a Git repository to inspect branch changes and related specs.",
+                    "选择 Git 仓库以查看分支改动与关联规范。"
                 ))
                 .font(.system(size: 11.5))
                 .foregroundStyle(.secondary)
