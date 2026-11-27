@@ -4,7 +4,7 @@ import SwiftUI
 import TrellisCore
 
 /// Borderless, non-activating floating `NSPanel` that never steals focus while collapsed,
-/// and smoothly becomes key when expanded so buttons, menus, and text fields respond on the first click.
+/// and smoothly becomes key & resizable when expanded so buttons, menus, and text fields respond on click #1.
 public final class HUDPanel: NSPanel {
     public var allowKeyFocus: Bool = false
 
@@ -31,19 +31,42 @@ public final class HUDPanel: NSPanel {
     }
 }
 
+private struct HUDResizeEdges: OptionSet {
+    let rawValue: Int
+    static let left = HUDResizeEdges(rawValue: 1 << 0)
+    static let right = HUDResizeEdges(rawValue: 1 << 1)
+    static let bottom = HUDResizeEdges(rawValue: 1 << 2)
+    static let top = HUDResizeEdges(rawValue: 1 << 3)
+}
+
 /// Custom `NSHostingView` that:
 /// 1. Accepts first mouse click immediately (`acceptsFirstMouse -> true`) so SwiftUI buttons/tabs never drop click #1.
 /// 2. Keeps its CoreAnimation layer strictly transparent (no rectangular backdrop/shadow artifacts).
 /// 3. Handles collapsed Edge Pill dragging directly in AppKit screen coordinates (`NSEvent.mouseLocation`)
 ///    to completely eliminate SwiftUI `DragGesture` coordinate-feedback ghosting.
+/// 4. Provides generous 7pt borderless edge & corner resize grab zones when the Workbench is expanded,
+///    with crisp resize cursor feedback and live clamped frame resizing.
 public final class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
     public var isEdgePillDraggable: (() -> Bool)?
     public var onEdgePillTapped: (() -> Void)?
     public var onEdgePillDragEnded: (() -> Void)?
 
+    public var isWorkbenchResizable: (() -> Bool)?
+    public var allowTopEdgeResize: (() -> Bool)?
+    public var onResizeStateChanged: ((Bool) -> Void)?
+    public var onWorkbenchResized: ((NSSize) -> Void)?
+
+    private var resizeHitInset: CGFloat { 7.0 }
+    private var cornerHitInset: CGFloat { 14.0 }
+
     private var dragStartMouse: NSPoint?
     private var dragStartOrigin: NSPoint?
     private var didExceedDragThreshold: Bool = false
+
+    private var activeResizeEdges: HUDResizeEdges = []
+    private var resizeStartMouse: NSPoint?
+    private var resizeStartFrame: NSRect?
+    private var trackingAreaRef: NSTrackingArea?
 
     public required init(rootView: Content) {
         super.init(rootView: rootView)
@@ -63,17 +86,65 @@ public final class FirstMouseHostingView<Content: View>: NSHostingView<Content> 
         true
     }
 
+    public override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let existing = trackingAreaRef {
+            removeTrackingArea(existing)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.activeAlways, .mouseMoved, .mouseEnteredAndExited, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingAreaRef = area
+    }
+
+    public override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        guard activeResizeEdges.isEmpty else { return }
+        let local = convert(event.locationInWindow, from: nil)
+        let edges = resizeEdges(at: local)
+        updateCursor(for: edges)
+    }
+
+    public override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        if activeResizeEdges.isEmpty {
+            NSCursor.arrow.set()
+        }
+    }
+
     public override func mouseDown(with event: NSEvent) {
-        if event.type == .leftMouseDown, isEdgePillDraggable?() == true, let window {
-            dragStartMouse = NSEvent.mouseLocation
-            dragStartOrigin = window.frame.origin
-            didExceedDragThreshold = false
-            return
+        if event.type == .leftMouseDown {
+            // 1. Collapsed Edge Pill screen-space drag / tap
+            if isEdgePillDraggable?() == true, let window {
+                dragStartMouse = NSEvent.mouseLocation
+                dragStartOrigin = window.frame.origin
+                didExceedDragThreshold = false
+                return
+            }
+
+            // 2. Expanded Workbench borderless edge / corner resize
+            if isWorkbenchResizable?() == true, let window {
+                let local = convert(event.locationInWindow, from: nil)
+                let edges = resizeEdges(at: local)
+                if !edges.isEmpty {
+                    activeResizeEdges = edges
+                    resizeStartMouse = NSEvent.mouseLocation
+                    resizeStartFrame = window.frame
+                    onResizeStateChanged?(true)
+                    updateCursor(for: edges)
+                    return
+                }
+            }
         }
         super.mouseDown(with: event)
     }
 
     public override func mouseDragged(with event: NSEvent) {
+        // 1. Edge Pill dragging
         if let startMouse = dragStartMouse, let startOrigin = dragStartOrigin, let window {
             let current = NSEvent.mouseLocation
             let dx = current.x - startMouse.x
@@ -89,6 +160,44 @@ public final class FirstMouseHostingView<Content: View>: NSHostingView<Content> 
             }
             return
         }
+
+        // 2. Expanded Workbench live edge/corner resize
+        if !activeResizeEdges.isEmpty,
+           let startMouse = resizeStartMouse,
+           let startFrame = resizeStartFrame,
+           let window {
+            let current = NSEvent.mouseLocation
+            let dx = current.x - startMouse.x
+            let dy = current.y - startMouse.y
+            let minSize = window.minSize
+            let maxSize = window.maxSize
+
+            var newFrame = startFrame
+
+            if activeResizeEdges.contains(.right) {
+                let targetW = min(max(startFrame.width + dx, minSize.width), maxSize.width)
+                newFrame.size.width = targetW.rounded()
+            } else if activeResizeEdges.contains(.left) {
+                let targetW = min(max(startFrame.width - dx, minSize.width), maxSize.width)
+                let deltaW = targetW - startFrame.width
+                newFrame.origin.x = (startFrame.origin.x - deltaW).rounded()
+                newFrame.size.width = targetW.rounded()
+            }
+
+            if activeResizeEdges.contains(.top) {
+                let targetH = min(max(startFrame.height + dy, minSize.height), maxSize.height)
+                newFrame.size.height = targetH.rounded()
+            } else if activeResizeEdges.contains(.bottom) {
+                let targetH = min(max(startFrame.height - dy, minSize.height), maxSize.height)
+                let deltaH = targetH - startFrame.height
+                newFrame.origin.y = (startFrame.origin.y - deltaH).rounded()
+                newFrame.size.height = targetH.rounded()
+            }
+
+            window.setFrame(newFrame, display: true)
+            return
+        }
+
         super.mouseDragged(with: event)
     }
 
@@ -105,7 +214,65 @@ public final class FirstMouseHostingView<Content: View>: NSHostingView<Content> 
             }
             return
         }
+
+        if !activeResizeEdges.isEmpty {
+            activeResizeEdges = []
+            resizeStartMouse = nil
+            resizeStartFrame = nil
+            onResizeStateChanged?(false)
+            NSCursor.arrow.set()
+            if let window {
+                onWorkbenchResized?(window.frame.size)
+            }
+            return
+        }
+
         super.mouseUp(with: event)
+    }
+
+    private func resizeEdges(at point: NSPoint) -> HUDResizeEdges {
+        guard isWorkbenchResizable?() == true else { return [] }
+        let b = bounds
+        guard b.width > 40, b.height > 40 else { return [] }
+
+        // Generous bottom-right & bottom-left corner grab zones
+        let nearLeft = point.x <= resizeHitInset
+        let nearRight = point.x >= b.width - resizeHitInset
+        let nearBottom = point.y <= resizeHitInset
+        let nearTop = (allowTopEdgeResize?() == true) && (point.y >= b.height - resizeHitInset)
+
+        let inBottomRightCorner = point.x >= b.width - cornerHitInset && point.y <= cornerHitInset
+        let inBottomLeftCorner = point.x <= cornerHitInset && point.y <= cornerHitInset
+
+        var edges: HUDResizeEdges = []
+        if inBottomRightCorner {
+            edges.insert([.right, .bottom])
+            return edges
+        }
+        if inBottomLeftCorner {
+            edges.insert([.left, .bottom])
+            return edges
+        }
+        if nearLeft { edges.insert(.left) }
+        if nearRight { edges.insert(.right) }
+        if nearBottom { edges.insert(.bottom) }
+        if nearTop { edges.insert(.top) }
+        return edges
+    }
+
+    private func updateCursor(for edges: HUDResizeEdges) {
+        if edges.isEmpty {
+            return
+        }
+        let horizontal = edges.contains(.left) || edges.contains(.right)
+        let vertical = edges.contains(.top) || edges.contains(.bottom)
+        if horizontal && vertical {
+            NSCursor.crosshair.set()
+        } else if horizontal {
+            NSCursor.resizeLeftRight.set()
+        } else if vertical {
+            NSCursor.resizeUpDown.set()
+        }
     }
 }
 
@@ -121,9 +288,9 @@ private final class PanelMetricsState {
 }
 
 /// Hosts the dual-mode HUD window (True Notch HUD ↔ Edge-Docked Floating Pill)
-/// and coordinates smooth collapsed ↔ expanded Workbench transitions without view-tree teardown.
+/// and coordinates smooth collapsed ↔ expanded Workbench transitions with native resizing.
 @MainActor
-public final class HUDPanelController {
+public final class HUDPanelController: NSObject, NSWindowDelegate {
     private let store: HUDStore
     private let panel: HUDPanel
     private let metricsState: PanelMetricsState
@@ -134,6 +301,8 @@ public final class HUDPanelController {
     nonisolated(unsafe) private var localKeyMonitor: Any?
     nonisolated(unsafe) private var screenObserver: NSObjectProtocol?
     private var isModalOpen: Bool = false
+    private var isLiveResizing: Bool = false
+    private var isProgrammaticFrameUpdate: Bool = false
 
     public init(store: HUDStore) {
         self.store = store
@@ -173,6 +342,10 @@ public final class HUDPanelController {
         self.hostingView.autoresizingMask = [.width, .height]
         self.panel.contentView = self.hostingView
 
+        super.init()
+
+        self.panel.delegate = self
+
         // Set the permanent root view ONCE with weak-self callbacks; never reassign `rootView` again.
         self.hostingView.rootView = HUDRootContainerView(
             store: store,
@@ -194,6 +367,19 @@ public final class HUDPanelController {
         }
         self.hostingView.onEdgePillDragEnded = { [weak self] in
             self?.handlePillDragEnd()
+        }
+        self.hostingView.isWorkbenchResizable = { [weak self] in
+            self?.store.isExpanded == true
+        }
+        self.hostingView.allowTopEdgeResize = { [weak self] in
+            self?.store.presentationMode == .edgePill
+        }
+        self.hostingView.onResizeStateChanged = { [weak self] resizing in
+            self?.isLiveResizing = resizing
+        }
+        self.hostingView.onWorkbenchResized = { [weak self] newSize in
+            guard let self, self.store.isExpanded else { return }
+            self.store.setWorkbenchSize(newSize)
         }
 
         bindStoreCallbacks()
@@ -236,11 +422,32 @@ public final class HUDPanelController {
         panel.level = suppressed ? .floating : .statusBar
     }
 
+    // MARK: NSWindowDelegate
+
+    public func windowWillStartLiveResize(_ notification: Notification) {
+        isLiveResizing = true
+    }
+
+    public func windowDidEndLiveResize(_ notification: Notification) {
+        isLiveResizing = false
+        if store.isExpanded {
+            store.setWorkbenchSize(panel.frame.size)
+        }
+    }
+
+    public func windowDidResize(_ notification: Notification) {
+        guard store.isExpanded, !isProgrammaticFrameUpdate else { return }
+        store.setWorkbenchSize(panel.frame.size)
+    }
+
+    // MARK: Store Wiring
+
     private func bindStoreCallbacks() {
         store.onPresentationModeChanged = { [weak self] _ in
             guard let self else { return }
             self.hoverExpandTask?.cancel()
             self.updateMetricsForTargetScreen()
+            self.updatePanelResizability(expanded: self.store.isExpanded)
             self.updatePanelFrame(animated: true)
         }
 
@@ -249,11 +456,13 @@ public final class HUDPanelController {
             self.hoverExpandTask?.cancel()
             self.panel.allowKeyFocus = expanded
             self.updateMetricsForTargetScreen()
+            self.updatePanelResizability(expanded: expanded)
             self.updatePanelFrame(animated: true)
             if expanded {
                 self.installInteractionMonitors()
                 self.panel.makeKeyAndOrderFront(nil)
             } else {
+                self.isLiveResizing = false
                 self.removeInteractionMonitors()
                 self.panel.orderFrontRegardless()
             }
@@ -268,6 +477,24 @@ public final class HUDPanelController {
         }
     }
 
+    private func updatePanelResizability(expanded: Bool) {
+        if expanded {
+            if !panel.styleMask.contains(.resizable) {
+                panel.styleMask.insert(.resizable)
+            }
+            panel.minSize = ScreenGeometry.minWorkbenchSize
+            if let screen = currentTargetScreen() {
+                panel.maxSize = ScreenGeometry.maxWorkbenchSize(on: screen)
+            }
+        } else {
+            if panel.styleMask.contains(.resizable) {
+                panel.styleMask.remove(.resizable)
+            }
+            panel.minSize = NSSize(width: 40, height: 24)
+            panel.maxSize = NSSize(width: 4000, height: 4000)
+        }
+    }
+
     private func observeScreenChanges() {
         screenObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
@@ -275,8 +502,10 @@ public final class HUDPanelController {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                self?.updateMetricsForTargetScreen()
-                self?.updatePanelFrame(animated: false)
+                guard let self else { return }
+                self.updateMetricsForTargetScreen()
+                self.updatePanelResizability(expanded: self.store.isExpanded)
+                self.updatePanelFrame(animated: false)
             }
         }
     }
@@ -304,6 +533,7 @@ public final class HUDPanelController {
                 mode: store.presentationMode,
                 anchor: store.edgeAnchor,
                 verticalRatio: store.edgeVerticalRatio,
+                preferredSize: store.workbenchSize,
                 on: screen
             )
         } else {
@@ -315,14 +545,20 @@ public final class HUDPanelController {
             )
         }
 
+        isProgrammaticFrameUpdate = true
         if animated {
-            NSAnimationContext.runAnimationGroup { ctx in
+            NSAnimationContext.runAnimationGroup({ ctx in
                 ctx.duration = 0.20
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
                 panel.animator().setFrame(target, display: true)
-            }
+            }, completionHandler: { [weak self] in
+                Task { @MainActor in
+                    self?.isProgrammaticFrameUpdate = false
+                }
+            })
         } else {
             panel.setFrame(target, display: true)
+            isProgrammaticFrameUpdate = false
         }
     }
 
@@ -359,7 +595,7 @@ public final class HUDPanelController {
     // MARK: Click-Outside & Escape Collapse Monitors
 
     private func isClickInsideOwnWindows(_ clickPoint: NSPoint) -> Bool {
-        if panel.frame.contains(clickPoint) {
+        if panel.frame.insetBy(dx: -8, dy: -8).contains(clickPoint) {
             return true
         }
         // Ignore clicks landing inside SwiftUI popovers, NSMenu popups, or attached sheets belonging to this app
@@ -378,7 +614,11 @@ public final class HUDPanelController {
             matching: [.leftMouseDown, .rightMouseDown]
         ) { [weak self] _ in
             Task { @MainActor in
-                guard let self, self.store.isExpanded, !self.store.isSettingsOpen, !self.isModalOpen else {
+                guard let self,
+                      self.store.isExpanded,
+                      !self.store.isSettingsOpen,
+                      !self.isModalOpen,
+                      !self.isLiveResizing else {
                     return
                 }
                 let clickPoint = NSEvent.mouseLocation

@@ -646,6 +646,7 @@ struct MarkdownRendererView: View, Equatable {
     let markdown: String
     var collapseSectionsByDefault: Bool = false
     var isChinese: Bool = false
+    var onOpenURL: ((URL) -> Bool)? = nil
 
     nonisolated static func == (lhs: MarkdownRendererView, rhs: MarkdownRendererView) -> Bool {
         lhs.markdown == rhs.markdown
@@ -655,36 +656,47 @@ struct MarkdownRendererView: View, Equatable {
 
     var body: some View {
         let doc = MarkdownDocumentCache.document(for: markdown)
-        if doc.frontmatter.isEmpty && doc.leadingBlocks.isEmpty && doc.sections.isEmpty {
-            VStack(spacing: 6) {
-                Image(systemName: "doc.text")
-                    .font(.title3)
-                    .foregroundStyle(.secondary)
-                Text(isChinese ? "空文档" : "Empty document")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, minHeight: 80)
-        } else {
-            LazyVStack(alignment: .leading, spacing: 10) {
-                if !doc.frontmatter.isEmpty {
-                    FrontmatterBar(entries: doc.frontmatter)
+        Group {
+            if doc.frontmatter.isEmpty && doc.leadingBlocks.isEmpty && doc.sections.isEmpty {
+                VStack(spacing: 6) {
+                    Image(systemName: "doc.text")
+                        .font(.title3)
+                        .foregroundStyle(.secondary)
+                    Text(isChinese ? "空文档" : "Empty document")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
+                .frame(maxWidth: .infinity, minHeight: 80)
+            } else {
+                LazyVStack(alignment: .leading, spacing: 10) {
+                    if !doc.frontmatter.isEmpty {
+                        FrontmatterBar(entries: doc.frontmatter)
+                    }
 
-                ForEach(doc.leadingBlocks) { block in
-                    MarkdownBlockView(block: block, isChinese: isChinese)
-                }
+                    ForEach(doc.leadingBlocks) { block in
+                        MarkdownBlockView(block: block, isChinese: isChinese)
+                    }
 
-                ForEach(doc.sections) { section in
-                    CollapsibleH2Section(
-                        section: section,
-                        initiallyExpanded: !collapseSectionsByDefault,
-                        isChinese: isChinese
-                    )
+                    ForEach(doc.sections) { section in
+                        CollapsibleH2Section(
+                            section: section,
+                            initiallyExpanded: !collapseSectionsByDefault,
+                            isChinese: isChinese
+                        )
+                    }
                 }
+                .textSelection(.enabled)
             }
-            .textSelection(.enabled)
         }
+        .environment(\.openURL, OpenURLAction { url in
+            if let onOpenURL, onOpenURL(url) {
+                return .handled
+            }
+            if let scheme = url.scheme?.lowercased(), ["http", "https", "mailto"].contains(scheme) {
+                return .systemAction
+            }
+            return .handled
+        })
     }
 }
 

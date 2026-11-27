@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import SwiftUI
 import TrellisCore
@@ -369,5 +370,136 @@ struct EmptyStatePlaceholder: View {
         }
         .padding(.vertical, 24)
         .frame(maxWidth: .infinity)
+    }
+}
+
+// MARK: - Draggable & Collapsible Split View
+
+struct DraggableSplitView<Sidebar: View, Detail: View>: View {
+    @AppStorage private var storedWidth: Double
+    let minWidth: CGFloat
+    let maxWidth: CGFloat
+    @Binding var isSidebarCollapsed: Bool
+    @ViewBuilder let sidebar: () -> Sidebar
+    @ViewBuilder let detail: () -> Detail
+
+    @State private var dragStartWidth: CGFloat?
+    @State private var isHoveringDivider = false
+    @State private var isDraggingDivider = false
+    @State private var cursorPushed = false
+
+    init(
+        storageKey: String,
+        defaultWidth: CGFloat = 220,
+        minWidth: CGFloat = 170,
+        maxWidth: CGFloat = 360,
+        isSidebarCollapsed: Binding<Bool>,
+        @ViewBuilder sidebar: @escaping () -> Sidebar,
+        @ViewBuilder detail: @escaping () -> Detail
+    ) {
+        self._storedWidth = AppStorage(wrappedValue: Double(defaultWidth), storageKey)
+        self.minWidth = minWidth
+        self.maxWidth = maxWidth
+        self._isSidebarCollapsed = isSidebarCollapsed
+        self.sidebar = sidebar
+        self.detail = detail
+    }
+
+    private var clampedWidth: CGFloat {
+        min(max(CGFloat(storedWidth), minWidth), maxWidth)
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            if !isSidebarCollapsed {
+                sidebar()
+                    .frame(width: clampedWidth)
+                    .frame(maxHeight: .infinity)
+
+                splitDivider
+            }
+
+            detail()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .coordinateSpace(name: "DraggableSplitSpace")
+        .onDisappear {
+            popCursorIfNeeded()
+        }
+    }
+
+    private var splitDivider: some View {
+        ZStack {
+            Rectangle()
+                .fill(
+                    (isHoveringDivider || isDraggingDivider)
+                        ? Color.accentColor.opacity(0.75)
+                        : Color(nsColor: .separatorColor).opacity(0.55)
+                )
+                .frame(width: (isHoveringDivider || isDraggingDivider) ? 2 : 1)
+        }
+        .frame(width: 6)
+        .frame(maxHeight: .infinity)
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            isHoveringDivider = hovering
+            updateResizeCursor()
+        }
+        .gesture(
+            DragGesture(minimumDistance: 0, coordinateSpace: .named("DraggableSplitSpace"))
+                .onChanged { value in
+                    if dragStartWidth == nil {
+                        dragStartWidth = clampedWidth
+                        isDraggingDivider = true
+                        updateResizeCursor()
+                    }
+                    let base = dragStartWidth ?? clampedWidth
+                    let proposed = min(max(base + value.translation.width, minWidth), maxWidth)
+                    storedWidth = Double(proposed)
+                }
+                .onEnded { _ in
+                    dragStartWidth = nil
+                    isDraggingDivider = false
+                    updateResizeCursor()
+                }
+        )
+    }
+
+    private func updateResizeCursor() {
+        let shouldShow = isHoveringDivider || isDraggingDivider
+        if shouldShow && !cursorPushed {
+            NSCursor.resizeLeftRight.push()
+            cursorPushed = true
+        } else if !shouldShow && cursorPushed {
+            NSCursor.pop()
+            cursorPushed = false
+        }
+    }
+
+    private func popCursorIfNeeded() {
+        if cursorPushed {
+            NSCursor.pop()
+            cursorPushed = false
+        }
+    }
+}
+
+// MARK: - Subtle Bottom-Right Window Resize Grip Affordance
+
+struct ResizeGripAffordance: View {
+    var body: some View {
+        Canvas { context, size in
+            let stroke = Color.secondary.opacity(0.45)
+            let offsets: [CGFloat] = [3.5, 7.5, 11.5]
+            for offset in offsets {
+                var path = Path()
+                path.move(to: CGPoint(x: size.width - offset, y: size.height - 1.5))
+                path.addLine(to: CGPoint(x: size.width - 1.5, y: size.height - offset))
+                context.stroke(path, with: .color(stroke), style: StrokeStyle(lineWidth: 1.1, lineCap: .round))
+            }
+        }
+        .frame(width: 14, height: 14)
+        .padding(4)
+        .allowsHitTesting(false)
     }
 }

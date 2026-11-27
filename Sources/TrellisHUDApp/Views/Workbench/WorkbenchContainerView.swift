@@ -34,6 +34,9 @@ public struct WorkbenchContainerView: View {
         .overlay(
             shape.strokeBorder(Color(nsColor: .separatorColor).opacity(0.65), lineWidth: 0.75)
         )
+        .overlay(alignment: .bottomTrailing) {
+            ResizeGripAffordance()
+        }
         .shadow(color: Color.black.opacity(0.24), radius: 22, x: 0, y: 10)
         .onExitCommand {
             store.collapse()

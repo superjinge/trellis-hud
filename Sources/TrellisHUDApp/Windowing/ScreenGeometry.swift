@@ -13,7 +13,9 @@ public struct ScreenGeometry: Sendable {
         public let visibleFrame: NSRect
     }
 
-    public static let workbenchSize = NSSize(width: 720, height: 520)
+    public static let defaultWorkbenchSize = NSSize(width: 840, height: 580)
+    public static let workbenchSize = defaultWorkbenchSize
+    public static let minWorkbenchSize = NSSize(width: 640, height: 420)
     public static let edgePillSize = NSSize(width: 196, height: 34)
     /// Transparent margin around the collapsed Edge Pill so its soft drop-shadow renders cleanly
     /// without ever clipping into 4 gray rectangular corners at the borderless window edge.
@@ -57,6 +59,15 @@ public struct ScreenGeometry: Sendable {
             notchHeight: fallbackTopPillSize.height,
             screenFrame: screen.frame,
             visibleFrame: screen.visibleFrame
+        )
+    }
+
+    /// Maximum allowed Workbench window size on the given screen.
+    public static func maxWorkbenchSize(on screen: NSScreen) -> NSSize {
+        let vf = screen.visibleFrame
+        return NSSize(
+            width: max(minWorkbenchSize.width, (vf.width - 32).rounded()),
+            height: max(minWorkbenchSize.height, (vf.height - 32).rounded())
         )
     }
 
@@ -125,16 +136,18 @@ public struct ScreenGeometry: Sendable {
         }
     }
 
-    /// Computes expanded Workbench panel frame, anchored seamlessly to either the Notch or the Edge Pill.
+    /// Computes expanded Workbench panel frame using the persisted/preferred size clamped to screen bounds.
     public static func expandedFrame(
         mode: PresentationMode,
         anchor: EdgeAnchor,
         verticalRatio: Double,
+        preferredSize: NSSize = defaultWorkbenchSize,
         on screen: NSScreen
     ) -> NSRect {
         let vf = screen.visibleFrame
-        let targetWidth = min(workbenchSize.width, vf.width - edgeMargin * 2)
-        let targetHeight = min(workbenchSize.height, vf.height - edgeMargin * 2)
+        let maxSize = maxWorkbenchSize(on: screen)
+        let targetWidth = min(max(preferredSize.width, minWorkbenchSize.width), maxSize.width)
+        let targetHeight = min(max(preferredSize.height, minWorkbenchSize.height), maxSize.height)
 
         switch mode {
         case .notch:

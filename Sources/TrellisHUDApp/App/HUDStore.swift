@@ -227,6 +227,7 @@ public final class HUDStore {
     public var selectedTab: WorkbenchTab = .flow
     public var docsSubMode: DocsSubMode = .taskDocs
     public var showMenuBarIcon: Bool
+    public var workbenchSize: CGSize
 
     public var language: AppLanguage {
         config.language
@@ -323,6 +324,8 @@ public final class HUDStore {
     private var lastLoadedDocTaskDir: String?
 
     private static let showMenuBarIconDefaultsKey = "trellisHUD.showMenuBarIcon"
+    private static let workbenchWidthDefaultsKey = "trellisHUD.workbenchWidth"
+    private static let workbenchHeightDefaultsKey = "trellisHUD.workbenchHeight"
     private static let maxActivityHistory = 60
 
     // MARK: Init
@@ -337,6 +340,12 @@ public final class HUDStore {
         } else {
             self.showMenuBarIcon = true
         }
+        let savedW = UserDefaults.standard.double(forKey: Self.workbenchWidthDefaultsKey)
+        let savedH = UserDefaults.standard.double(forKey: Self.workbenchHeightDefaultsKey)
+        self.workbenchSize = CGSize(
+            width: savedW >= 640 ? savedW : 840,
+            height: savedH >= 420 ? savedH : 580
+        )
         // Hook statuses are loaded asynchronously on launch / Settings open to keep init non-blocking.
     }
 
@@ -529,6 +538,20 @@ public final class HUDStore {
         onLanguageChanged?(l10n)
     }
 
+    /// Persists the user-resized expanded Workbench window dimensions without triggering frame animations.
+    public func setWorkbenchSize(_ size: CGSize) {
+        let clamped = CGSize(
+            width: max(640, size.width.rounded()),
+            height: max(420, size.height.rounded())
+        )
+        guard abs(workbenchSize.width - clamped.width) >= 1 || abs(workbenchSize.height - clamped.height) >= 1 else {
+            return
+        }
+        workbenchSize = clamped
+        UserDefaults.standard.set(Double(clamped.width), forKey: Self.workbenchWidthDefaultsKey)
+        UserDefaults.standard.set(Double(clamped.height), forKey: Self.workbenchHeightDefaultsKey)
+    }
+
     // MARK: Selection & Cross-Tab Navigation
 
     public func selectProject(_ path: String?) {
@@ -568,9 +591,112 @@ public final class HUDStore {
     }
 
     public func openSpecInDocsTab(_ specPath: String) {
-        selectedSpecPath = specPath
+        if let match = specs.first(where: { $0.relativePath == specPath || $0.absolutePath == specPath }) {
+            selectedSpecPath = match.relativePath
+        } else {
+            selectedSpecPath = specPath
+        }
         docsSubMode = .projectSpecs
         selectedTab = .docsSpecs
+    }
+
+    /// Routes Markdown links safely in-app so schemeless relative URLs NEVER leak to macOS Finder (`-50` paramErr).
+    /// Returns `true` when handled internally (or gracefully suppressed with toast), `false` when SwiftUI should delegate
+    /// to the system browser (`http`, `https`, `mailto`).
+    public func handleMarkdownLink(
+        _ url: URL,
+        baseFilePath: String?,
+        currentTask: TaskSnapshot? = nil,
+        onSelectTaskDoc: ((String) -> Void)? = nil
+    ) -> Bool {
+        if let scheme = url.scheme?.lowercased(), ["http", "https", "mailto"].contains(scheme) {
+            return false
+        }
+
+        let rawString = url.absoluteString
+        if rawString.hasPrefix("#") {
+            return true
+        }
+
+        // Extract raw filesystem/relative path without fragment or query
+        let rawPath: String
+        if url.isFileURL {
+            rawPath = url.path
+        } else {
+            let candidate = url.relativeString.isEmpty ? rawString : url.relativeString
+            let withoutFragment = candidate.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? candidate
+            let withoutQuery = withoutFragment.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? withoutFragment
+            rawPath = (withoutQuery.removingPercentEncoding ?? withoutQuery).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        guard !rawPath.isEmpty else {
+            return true
+        }
+
+        // Build candidate normalized absolute paths
+        var candidates: [String] = []
+        func appendCandidate(_ path: String) {
+            let norm = ConfigStore.normalizePath(path)
+            if !norm.isEmpty && !candidates.contains(norm) {
+                candidates.append(norm)
+            }
+        }
+
+        if rawPath.hasPrefix("/") || rawPath.hasPrefix("~") {
+            appendCandidate(rawPath)
+        } else {
+            if let baseFilePath, !baseFilePath.isEmpty {
+                let baseDir = URL(fileURLWithPath: ConfigStore.normalizePath(baseFilePath)).deletingLastPathComponent()
+                appendCandidate(baseDir.appendingPathComponent(rawPath).path)
+            }
+            if let taskDir = currentTask?.taskDirectoryPath, !taskDir.isEmpty {
+                appendCandidate(URL(fileURLWithPath: taskDir).appendingPathComponent(rawPath).path)
+            }
+            if let projectPath = selectedProjectPath, !projectPath.isEmpty {
+                appendCandidate(URL(fileURLWithPath: projectPath).appendingPathComponent(rawPath).path)
+            }
+        }
+
+        // 1. Check if any candidate matches a known Project Spec
+        for candidate in candidates {
+            if let spec = specs.first(where: { ConfigStore.normalizePath($0.absolutePath) == candidate }) {
+                openSpecInDocsTab(spec.relativePath)
+                return true
+            }
+        }
+
+        // 2. Check if any candidate lies inside the current task directory
+        if let task = currentTask {
+            let normalizedTaskDir = ConfigStore.normalizePath(task.taskDirectoryPath)
+            let prefix = normalizedTaskDir.hasSuffix("/") ? normalizedTaskDir : normalizedTaskDir + "/"
+            for candidate in candidates where candidate.hasPrefix(prefix) {
+                if FileManager.default.fileExists(atPath: candidate) {
+                    let relPath = String(candidate.dropFirst(prefix.count))
+                    if let onSelectTaskDoc {
+                        onSelectTaskDoc(relPath)
+                    } else if task.id == selectedTask?.id {
+                        loadDocument(relPath)
+                    } else {
+                        openInEditor(path: candidate)
+                    }
+                    return true
+                }
+            }
+        }
+
+        // 3. Open existing local file cleanly via URL(fileURLWithPath:)
+        for candidate in candidates {
+            if FileManager.default.fileExists(atPath: candidate) {
+                openInEditor(path: candidate)
+                return true
+            }
+        }
+
+        // 4. Missing target: show localized toast and return true so Finder never receives a bad URL
+        let displayName = URL(fileURLWithPath: rawPath).lastPathComponent
+        let label = displayName.isEmpty ? rawPath : displayName
+        showToast(l10n.t("Link target not found: \(label)", "未找到链接目标：\(label)"), isError: true)
+        return true
     }
 
     // MARK: Refresh Pipeline (Equality-Guarded, Zero Double-Scan, Lazy History)

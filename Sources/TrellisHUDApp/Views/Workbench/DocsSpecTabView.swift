@@ -5,6 +5,7 @@ struct DocsSpecTabView: View {
     @Bindable var store: HUDStore
 
     @State private var specFilterQuery: String = ""
+    @AppStorage("trellisHud.specsSidebarCollapsed") private var isSpecsSidebarCollapsed: Bool = false
 
     var body: some View {
         let l10n = store.l10n
@@ -139,10 +140,26 @@ struct DocsSpecTabView: View {
                         }
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else {
+                        let baseFilePath: String? = store.selectedDocPath.map {
+                            URL(fileURLWithPath: task.taskDirectoryPath).appendingPathComponent($0).path
+                        }
                         ScrollView {
-                            MarkdownRendererView(markdown: store.selectedDocContent, isChinese: l10n.isChinese)
-                                .equatable()
-                                .padding(16)
+                            MarkdownRendererView(
+                                markdown: store.selectedDocContent,
+                                isChinese: l10n.isChinese,
+                                onOpenURL: { url in
+                                    store.handleMarkdownLink(
+                                        url,
+                                        baseFilePath: baseFilePath,
+                                        currentTask: task,
+                                        onSelectTaskDoc: { relPath in
+                                            store.loadDocument(relPath)
+                                        }
+                                    )
+                                }
+                            )
+                            .equatable()
+                            .padding(16)
                         }
                     }
                 }
@@ -160,7 +177,7 @@ struct DocsSpecTabView: View {
         }
     }
 
-    // MARK: - Mode 2: 3-Level Monorepo Project Specs Tree + Preview
+    // MARK: - Mode 2: 3-Level Monorepo Project Specs Tree + Preview (Draggable Split)
 
     private func projectSpecsView(l10n: L10n) -> some View {
         Group {
@@ -175,14 +192,16 @@ struct DocsSpecTabView: View {
                 )
                 .frame(maxHeight: .infinity)
             } else {
-                HStack(spacing: 0) {
+                DraggableSplitView(
+                    storageKey: "trellisHud.specsSidebarWidth",
+                    defaultWidth: 220,
+                    minWidth: 170,
+                    maxWidth: 360,
+                    isSidebarCollapsed: $isSpecsSidebarCollapsed
+                ) {
                     specTreeSidebar(l10n: l10n)
-                        .frame(width: 245)
-
-                    Divider().opacity(0.55)
-
+                } detail: {
                     specDetailPreview(l10n: l10n)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
         }
@@ -259,111 +278,167 @@ struct DocsSpecTabView: View {
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.42))
     }
 
+    private func sidebarToggleButton(l10n: L10n) -> some View {
+        Button {
+            isSpecsSidebarCollapsed.toggle()
+        } label: {
+            Image(systemName: "sidebar.left")
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(isSpecsSidebarCollapsed ? Color.accentColor : Color.secondary)
+                .frame(width: 24, height: 22)
+        }
+        .buttonStyle(InteractiveSurfaceButtonStyle(
+            isSelected: isSpecsSidebarCollapsed,
+            cornerRadius: 5,
+            baseFill: Color.primary.opacity(0.05),
+            selectedFill: Color.accentColor.opacity(0.16)
+        ))
+        .help(isSpecsSidebarCollapsed
+            ? l10n.t("Show spec sidebar", "展开左侧规范目录")
+            : l10n.t("Hide spec sidebar for full-width reading", "收起左侧目录以全宽阅读"))
+    }
+
     @ViewBuilder
     private func specDetailPreview(l10n: L10n) -> some View {
         if let spec = store.selectedSpec {
             VStack(alignment: .leading, spacing: 0) {
-                VStack(alignment: .leading, spacing: 7) {
-                    HStack(alignment: .center, spacing: 8) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(spec.name)
-                                .font(.system(size: 13.5, weight: .semibold))
-                            Text(spec.relativePath)
-                                .font(.system(size: 10.5, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                        }
-                        Spacer()
-                        Button {
-                            store.openSpecInEditor(spec)
-                        } label: {
-                            Label(l10n.t("Open", "打开"), systemImage: "square.and.pencil")
-                                .font(.system(size: 11))
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                    }
+                // Ultra-compact single sticky top bar
+                HStack(spacing: 8) {
+                    sidebarToggleButton(l10n: l10n)
 
-                    HStack(spacing: 6) {
-                        StatusPill(
-                            text: spec.isEmptyTemplate
-                                ? l10n.t("Empty Template", "空模板")
-                                : l10n.t("Filled", "已填写"),
-                            color: spec.isEmptyTemplate ? .orange : .green,
-                            systemImage: spec.isEmptyTemplate ? "exclamationmark.circle" : "checkmark.circle.fill"
-                        )
-                        StatusPill(text: l10n.t("\(spec.lineCount) lines", "\(spec.lineCount) 行"), color: .secondary)
-                        if spec.referencedByTaskCount > 0 {
-                            StatusPill(text: l10n.t("Ref ×\(spec.referencedByTaskCount)", "引用 ×\(spec.referencedByTaskCount)"), color: .blue)
-                        }
-                        if !spec.matchedModifiedFiles.isEmpty {
-                            StatusPill(
-                                text: l10n.t("\(spec.matchedModifiedFiles.count) dirty match", "命中 \(spec.matchedModifiedFiles.count) 个改动"),
-                                color: .green,
-                                systemImage: "checkmark.shield.fill"
-                            )
-                        }
-                    }
+                    Text(spec.name)
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
 
-                    if !spec.pathGlobs.isEmpty {
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 5) {
-                                Text("paths:")
-                                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                                    .foregroundStyle(.secondary)
-                                ForEach(spec.pathGlobs, id: \.self) { glob in
-                                    Text(glob)
-                                        .font(.system(size: 10, design: .monospaced))
-                                        .foregroundStyle(.primary.opacity(0.9))
-                                        .padding(.horizontal, 6)
-                                        .padding(.vertical, 2)
-                                        .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 4))
-                                }
-                            }
-                        }
-                    }
+                    StatusPill(
+                        text: spec.isEmptyTemplate
+                            ? l10n.t("Template", "空模板")
+                            : l10n.t("Filled", "已填写"),
+                        color: spec.isEmptyTemplate ? .orange : .green
+                    )
+                    StatusPill(text: "\(spec.lineCount)L", color: .secondary)
 
                     if !spec.matchedModifiedFiles.isEmpty {
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 5) {
-                                Text(l10n.t("matched:", "命中:"))
-                                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                                    .foregroundStyle(.green)
-                                ForEach(spec.matchedModifiedFiles, id: \.self) { file in
-                                    Text(file)
-                                        .font(.system(size: 10, design: .monospaced))
-                                        .foregroundStyle(.green)
-                                        .padding(.horizontal, 6)
-                                        .padding(.vertical, 2)
-                                        .background(Color.green.opacity(0.14), in: RoundedRectangle(cornerRadius: 4))
-                                }
-                            }
-                        }
+                        StatusPill(
+                            text: l10n.t("\(spec.matchedModifiedFiles.count) match", "命中 \(spec.matchedModifiedFiles.count)"),
+                            color: .green,
+                            systemImage: "checkmark.shield.fill"
+                        )
                     }
+
+                    Spacer(minLength: 4)
+
+                    Button {
+                        store.openSpecInEditor(spec)
+                    } label: {
+                        Label(l10n.t("Open", "打开"), systemImage: "square.and.pencil")
+                            .font(.system(size: 11))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
                 .background(Color(nsColor: .controlBackgroundColor).opacity(0.65))
 
                 Divider().opacity(0.5)
 
                 ScrollView {
-                    MarkdownRendererView(markdown: spec.content, isChinese: l10n.isChinese)
+                    VStack(alignment: .leading, spacing: 10) {
+                        // Compact metadata strip scrolls smoothly with the document
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(spacing: 6) {
+                                Text(spec.relativePath)
+                                    .font(.system(size: 10.5, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Spacer(minLength: 4)
+                                if spec.referencedByTaskCount > 0 {
+                                    StatusPill(
+                                        text: l10n.t("Ref ×\(spec.referencedByTaskCount)", "任务引用 ×\(spec.referencedByTaskCount)"),
+                                        color: .blue
+                                    )
+                                }
+                            }
+
+                            if !spec.pathGlobs.isEmpty {
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    HStack(spacing: 5) {
+                                        Text("paths:")
+                                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                            .foregroundStyle(.secondary)
+                                        ForEach(spec.pathGlobs, id: \.self) { glob in
+                                            Text(glob)
+                                                .font(.system(size: 10, design: .monospaced))
+                                                .foregroundStyle(.primary.opacity(0.9))
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 2)
+                                                .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 4))
+                                        }
+                                    }
+                                }
+                            }
+
+                            if !spec.matchedModifiedFiles.isEmpty {
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    HStack(spacing: 5) {
+                                        Text(l10n.t("matched:", "命中:"))
+                                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                            .foregroundStyle(.green)
+                                        ForEach(spec.matchedModifiedFiles, id: \.self) { file in
+                                            Text(file)
+                                                .font(.system(size: 10, design: .monospaced))
+                                                .foregroundStyle(.green)
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 2)
+                                                .background(Color.green.opacity(0.14), in: RoundedRectangle(cornerRadius: 4))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        .padding(.bottom, 4)
+
+                        Divider().opacity(0.45)
+
+                        MarkdownRendererView(
+                            markdown: spec.content,
+                            isChinese: l10n.isChinese,
+                            onOpenURL: { url in
+                                store.handleMarkdownLink(
+                                    url,
+                                    baseFilePath: spec.absolutePath,
+                                    currentTask: nil,
+                                    onSelectTaskDoc: nil
+                                )
+                            }
+                        )
                         .equatable()
-                        .padding(14)
+                    }
+                    .padding(14)
                 }
             }
         } else {
-            EmptyStatePlaceholder(
-                systemImage: "doc.text.magnifyingglass",
-                title: l10n.t("Select a Spec", "选择规范文档"),
-                subtitle: l10n.t(
-                    "Choose a specification from the tree on the left to inspect its globs, health, and guidelines.",
-                    "从左侧目录树中选择一份规范以查看路径匹配规则、完整度与详细内容。"
+            VStack(spacing: 0) {
+                HStack {
+                    sidebarToggleButton(l10n: l10n)
+                    Spacer()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+
+                EmptyStatePlaceholder(
+                    systemImage: "doc.text.magnifyingglass",
+                    title: l10n.t("Select a Spec", "选择规范文档"),
+                    subtitle: l10n.t(
+                        "Choose a specification from the tree on the left to inspect its globs, health, and guidelines.",
+                        "从左侧目录树中选择一份规范以查看路径匹配规则、完整度与详细内容。"
+                    )
                 )
-            )
-            .frame(maxHeight: .infinity)
+                .frame(maxHeight: .infinity)
+            }
         }
     }
 }

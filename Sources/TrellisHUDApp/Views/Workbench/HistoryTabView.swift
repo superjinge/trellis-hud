@@ -31,6 +31,7 @@ struct HistoryTabView: View {
     @State private var sourceFilter: SourceFilter = .all
     @State private var platformFilter: MemoryPlatform? = nil
     @State private var selection: HistorySelection? = nil
+    @AppStorage("trellisHud.historySidebarCollapsed") private var isSidebarCollapsed: Bool = false
 
     var body: some View {
         let l10n = store.l10n
@@ -39,12 +40,16 @@ struct HistoryTabView: View {
             filterHeader(l10n: l10n)
             Divider().opacity(0.55)
 
-            HStack(spacing: 0) {
+            DraggableSplitView(
+                storageKey: "trellisHud.historySidebarWidth",
+                defaultWidth: 220,
+                minWidth: 170,
+                maxWidth: 360,
+                isSidebarCollapsed: $isSidebarCollapsed
+            ) {
                 historyListPane(l10n: l10n)
-                    .frame(width: 265)
-                Divider().opacity(0.55)
+            } detail: {
                 historyPreviewPane(l10n: l10n)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .onAppear {
@@ -186,7 +191,7 @@ struct HistoryTabView: View {
             }
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 9)
+        .padding(.vertical, 8)
     }
 
     // MARK: - Filtered Collections
@@ -464,8 +469,12 @@ struct HistoryTabView: View {
         switch selection {
         case .archived(let id):
             if let task = filteredArchived.first(where: { $0.id == id }) {
-                ArchivedTaskPreviewPane(store: store, task: task)
-                    .id(task.id)
+                ArchivedTaskPreviewPane(
+                    store: store,
+                    task: task,
+                    isSidebarCollapsed: $isSidebarCollapsed
+                )
+                .id(task.id)
             } else {
                 emptyPreview(l10n: l10n)
             }
@@ -486,31 +495,56 @@ struct HistoryTabView: View {
         }
     }
 
+    private func sidebarToggleButton(l10n: L10n) -> some View {
+        Button {
+            isSidebarCollapsed.toggle()
+        } label: {
+            Image(systemName: "sidebar.left")
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(isSidebarCollapsed ? Color.accentColor : Color.secondary)
+                .frame(width: 24, height: 22)
+        }
+        .buttonStyle(InteractiveSurfaceButtonStyle(
+            isSelected: isSidebarCollapsed,
+            cornerRadius: 5,
+            baseFill: Color.primary.opacity(0.05),
+            selectedFill: Color.accentColor.opacity(0.16)
+        ))
+        .help(isSidebarCollapsed
+            ? l10n.t("Show history sidebar", "展开左侧历史列表")
+            : l10n.t("Hide history sidebar for full-width reading", "收起左侧列表以全宽阅读"))
+    }
+
     private func emptyPreview(l10n: L10n) -> some View {
-        EmptyStatePlaceholder(
-            systemImage: "doc.text.magnifyingglass",
-            title: l10n.t("Select a History Entry", "选择一条历史记录"),
-            subtitle: l10n.t(
-                "Choose an archived task, developer journal, or cross-platform trellis mem session on the left.",
-                "在左侧选择已归档任务、开发日志或跨平台 trellis mem 会话以查看完整内容。"
+        VStack(spacing: 0) {
+            HStack {
+                sidebarToggleButton(l10n: l10n)
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+
+            EmptyStatePlaceholder(
+                systemImage: "doc.text.magnifyingglass",
+                title: l10n.t("Select a History Entry", "选择一条历史记录"),
+                subtitle: l10n.t(
+                    "Choose an archived task, developer journal, or cross-platform trellis mem session on the left.",
+                    "在左侧选择已归档任务、开发日志或跨平台 trellis mem 会话以查看完整内容。"
+                )
             )
-        )
+            .frame(maxHeight: .infinity)
+        }
     }
 
     private func journalPreview(_ journal: WorkspaceJournal, l10n: L10n) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("\(journal.developer) · \(journal.fileName)")
-                        .font(.system(size: 13.5, weight: .semibold))
-                    Text(l10n.t(
-                        "\(journal.lineCount) lines · Updated \(HUDVisuals.shortDate(journal.mtime))",
-                        "\(journal.lineCount) 行 · 更新于 \(HUDVisuals.shortDate(journal.mtime))"
-                    ))
-                    .font(.system(size: 10.5, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                }
-                Spacer()
+            HStack(spacing: 8) {
+                sidebarToggleButton(l10n: l10n)
+                Text("\(journal.developer) · \(journal.fileName)")
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .lineLimit(1)
+                StatusPill(text: "\(journal.lineCount)L", color: .secondary)
+                Spacer(minLength: 4)
                 Button {
                     store.openInEditor(path: journal.filePath)
                 } label: {
@@ -520,17 +554,37 @@ struct HistoryTabView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
             }
-            .padding(14)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
             .background(Color(nsColor: .controlBackgroundColor).opacity(0.65))
 
             Divider().opacity(0.5)
 
             ScrollView {
-                MarkdownRendererView(
-                    markdown: journal.content.isEmpty ? journal.preview : journal.content,
-                    isChinese: l10n.isChinese
-                )
-                .equatable()
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(l10n.t(
+                        "Updated \(HUDVisuals.shortDate(journal.mtime)) · \(HUDVisuals.abbreviateHome(journal.filePath))",
+                        "更新于 \(HUDVisuals.shortDate(journal.mtime)) · \(HUDVisuals.abbreviateHome(journal.filePath))"
+                    ))
+                    .font(.system(size: 10.5, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
+                    MarkdownRendererView(
+                        markdown: journal.content.isEmpty ? journal.preview : journal.content,
+                        isChinese: l10n.isChinese,
+                        onOpenURL: { url in
+                            store.handleMarkdownLink(
+                                url,
+                                baseFilePath: journal.filePath,
+                                currentTask: nil,
+                                onSelectTaskDoc: nil
+                            )
+                        }
+                    )
+                    .equatable()
+                }
                 .padding(14)
             }
         }
@@ -538,45 +592,49 @@ struct HistoryTabView: View {
 
     private func memoryPreview(_ session: MemorySessionItem, l10n: L10n) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(alignment: .top) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(session.title?.isEmpty == false ? session.title! : session.id)
-                            .font(.system(size: 13.5, weight: .semibold))
-                        Text(session.id)
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                sidebarToggleButton(l10n: l10n)
+                StatusPill(text: HUDVisuals.displayName(for: session.platform, l10n: l10n), color: .purple)
+                Text(session.title?.isEmpty == false ? session.title! : session.id)
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 4)
+                if !session.filePath.isEmpty {
+                    Button {
+                        store.openInEditor(path: session.filePath)
+                    } label: {
+                        Label(l10n.t("Open", "打开"), systemImage: "doc.text")
+                            .font(.system(size: 11))
                     }
-                    Spacer()
-                    if !session.filePath.isEmpty {
-                        Button {
-                            store.openInEditor(path: session.filePath)
-                        } label: {
-                            Label(l10n.t("Open", "打开"), systemImage: "doc.text")
-                                .font(.system(size: 11))
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                    }
-                }
-
-                HStack(spacing: 6) {
-                    StatusPill(text: HUDVisuals.displayName(for: session.platform, l10n: l10n), color: .purple)
-                    if let cwd = session.cwd, !cwd.isEmpty {
-                        StatusPill(text: HUDVisuals.abbreviateHome(cwd), color: .secondary, systemImage: "folder")
-                    }
-                    if let updated = session.updatedAt ?? session.createdAt {
-                        StatusPill(text: HUDVisuals.shortDate(updated), color: .secondary)
-                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
                 }
             }
-            .padding(14)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
             .background(Color(nsColor: .controlBackgroundColor).opacity(0.65))
 
             Divider().opacity(0.5)
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 6) {
+                        Text(session.id)
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        if let cwd = session.cwd, !cwd.isEmpty {
+                            StatusPill(text: HUDVisuals.abbreviateHome(cwd), color: .secondary, systemImage: "folder")
+                        }
+                        if let updated = session.updatedAt ?? session.createdAt {
+                            StatusPill(text: HUDVisuals.shortDate(updated), color: .secondary)
+                        }
+                    }
+
+                    Divider().opacity(0.4)
+
                     if session.excerpts.isEmpty {
                         Text(l10n.t(
                             "No excerpts returned for this session. Type a query above to search session content via trellis mem.",
@@ -590,8 +648,19 @@ struct HistoryTabView: View {
                                 Text(excerpt.role.uppercased())
                                     .font(.system(size: 9.5, weight: .bold, design: .monospaced))
                                     .foregroundStyle(excerpt.role.lowercased() == "user" ? Color.blue : Color.secondary)
-                                MarkdownRendererView(markdown: excerpt.snippet, isChinese: l10n.isChinese)
-                                    .equatable()
+                                MarkdownRendererView(
+                                    markdown: excerpt.snippet,
+                                    isChinese: l10n.isChinese,
+                                    onOpenURL: { url in
+                                        store.handleMarkdownLink(
+                                            url,
+                                            baseFilePath: session.filePath.isEmpty ? nil : session.filePath,
+                                            currentTask: nil,
+                                            onSelectTaskDoc: nil
+                                        )
+                                    }
+                                )
+                                .equatable()
                             }
                             .padding(10)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -645,11 +714,12 @@ struct HistoryTabView: View {
     }
 }
 
-// MARK: - Archived Task Multi-Document Preview Pane (User Issue #3)
+// MARK: - Archived Task Multi-Document Preview Pane (Compact Sticky Header + 85%+ Reading Area)
 
 private struct ArchivedTaskPreviewPane: View {
     let store: HUDStore
     let task: TaskSnapshot
+    @Binding var isSidebarCollapsed: Bool
 
     private enum DocChoice: Hashable {
         case overview
@@ -660,10 +730,10 @@ private struct ArchivedTaskPreviewPane: View {
     @State private var loadedContent: String = ""
     @State private var isLoading: Bool = false
 
-    init(store: HUDStore, task: TaskSnapshot) {
+    init(store: HUDStore, task: TaskSnapshot, isSidebarCollapsed: Binding<Bool>) {
         self.store = store
         self.task = task
-        // Default directly to PRD (or first doc) when available so full archived docs are 1 click away!
+        self._isSidebarCollapsed = isSidebarCollapsed
         let docs = orderedTaskDocs(for: task, l10n: store.l10n)
         if let first = docs.first {
             self._selectedChoice = State(initialValue: .document(first.path))
@@ -677,89 +747,85 @@ private struct ArchivedTaskPreviewPane: View {
         let docs = orderedTaskDocs(for: task, l10n: l10n)
 
         VStack(alignment: .leading, spacing: 0) {
-            // Metadata header
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(alignment: .top, spacing: 8) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(task.record.title.isEmpty ? task.dir : task.record.title)
-                            .font(.system(size: 14, weight: .semibold))
-                        Text(task.dir)
-                            .font(.system(size: 10.5, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
+            // Single compact sticky bar: Sidebar toggle + Doc pills + Open / Finder
+            HStack(spacing: 6) {
+                Button {
+                    isSidebarCollapsed.toggle()
+                } label: {
+                    Image(systemName: "sidebar.left")
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(isSidebarCollapsed ? Color.accentColor : Color.secondary)
+                        .frame(width: 24, height: 22)
+                }
+                .buttonStyle(InteractiveSurfaceButtonStyle(
+                    isSelected: isSidebarCollapsed,
+                    cornerRadius: 5,
+                    baseFill: Color.primary.opacity(0.05),
+                    selectedFill: Color.accentColor.opacity(0.16)
+                ))
+                .help(isSidebarCollapsed
+                    ? l10n.t("Show history sidebar", "展开左侧历史列表")
+                    : l10n.t("Hide history sidebar for full-width reading", "收起左侧列表以全宽阅读"))
 
-                    if case .document(let relPath) = selectedChoice {
-                        Button {
-                            store.openDocumentInEditor(for: task, relativePath: relPath)
-                        } label: {
-                            Label(l10n.t("Open in Editor", "用编辑器打开"), systemImage: "square.and.pencil")
-                                .font(.system(size: 11))
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 5) {
+                        docPill(
+                            choice: .overview,
+                            label: l10n.t("Overview", "概览"),
+                            icon: "info.circle"
+                        )
+                        ForEach(docs) { doc in
+                            docPill(
+                                choice: .document(doc.path),
+                                label: doc.label,
+                                icon: doc.icon
+                            )
                         }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
                     }
+                }
 
+                Spacer(minLength: 4)
+
+                if case .document(let relPath) = selectedChoice {
                     Button {
-                        store.revealInFinder(path: task.taskDirectoryPath)
+                        store.openDocumentInEditor(for: task, relativePath: relPath)
                     } label: {
-                        Label(l10n.t("Reveal in Finder", "在访达中显示"), systemImage: "folder")
-                            .font(.system(size: 11))
+                        Label(l10n.t("Open", "打开"), systemImage: "square.and.pencil")
+                            .font(.system(size: 10.5))
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+                    .help(l10n.t("Open in Editor", "用编辑器打开"))
                 }
 
-                HStack(spacing: 6) {
-                    StatusPill(text: l10n.t("Archived", "已归档"), color: .green, systemImage: "archivebox.fill")
-                    StatusPill(text: task.record.priority, color: .secondary)
-                    if let branch = task.record.branch, !branch.isEmpty {
-                        StatusPill(text: branch, color: .blue, systemImage: "arrow.triangle.branch")
-                    }
-                    if let completed = task.record.completedAt, !completed.isEmpty {
-                        StatusPill(text: completed, color: .secondary)
-                    }
-                    if task.totalChecklistCount > 0 {
-                        StatusPill(
-                            text: l10n.t("\(task.completedChecklistCount)/\(task.totalChecklistCount) checks", "\(task.completedChecklistCount)/\(task.totalChecklistCount) 项清单"),
-                            color: .green
-                        )
-                    }
+                Button {
+                    store.revealInFinder(path: task.taskDirectoryPath)
+                } label: {
+                    Label(l10n.t("Finder", "访达"), systemImage: "folder")
+                        .font(.system(size: 10.5))
                 }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help(l10n.t("Reveal in Finder", "在访达中显示"))
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
             .background(Color(nsColor: .controlBackgroundColor).opacity(0.65))
 
-            Divider().opacity(0.45)
+            Divider().opacity(0.5)
 
-            // Document switcher bar (Overview + PRD / Design / Implement / Research / etc.)
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 6) {
-                    docPill(
-                        choice: .overview,
-                        label: l10n.t("Overview", "概览"),
-                        icon: "info.circle"
-                    )
-                    ForEach(docs) { doc in
-                        docPill(
-                            choice: .document(doc.path),
-                            label: doc.label,
-                            icon: doc.icon
-                        )
-                    }
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 7)
-            }
-            .background(Color(nsColor: .controlBackgroundColor).opacity(0.45))
-
-            Divider().opacity(0.45)
-
-            // Content body
+            // Full scrollable reading area (task header scrolls with Markdown body!)
             switch selectedChoice {
             case .overview:
-                overviewBody(l10n: l10n)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        scrollableTaskHeader(l10n: l10n)
+                        Divider().opacity(0.45)
+                        overviewContent(l10n: l10n)
+                    }
+                    .padding(14)
+                }
+
             case .document(let relPath):
                 if isLoading {
                     VStack(spacing: 8) {
@@ -770,10 +836,30 @@ private struct ArchivedTaskPreviewPane: View {
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
+                    let baseFilePath = URL(fileURLWithPath: task.taskDirectoryPath)
+                        .appendingPathComponent(relPath)
+                        .path
                     ScrollView {
-                        MarkdownRendererView(markdown: loadedContent, isChinese: l10n.isChinese)
+                        VStack(alignment: .leading, spacing: 12) {
+                            scrollableTaskHeader(l10n: l10n)
+                            Divider().opacity(0.45)
+                            MarkdownRendererView(
+                                markdown: loadedContent,
+                                isChinese: l10n.isChinese,
+                                onOpenURL: { url in
+                                    store.handleMarkdownLink(
+                                        url,
+                                        baseFilePath: baseFilePath,
+                                        currentTask: task,
+                                        onSelectTaskDoc: { targetRelPath in
+                                            selectedChoice = .document(targetRelPath)
+                                        }
+                                    )
+                                }
+                            )
                             .equatable()
-                            .padding(14)
+                        }
+                        .padding(14)
                     }
                 }
             }
@@ -788,6 +874,43 @@ private struct ArchivedTaskPreviewPane: View {
         }
     }
 
+    private func scrollableTaskHeader(l10n: L10n) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(task.record.title.isEmpty ? task.dir : task.record.title)
+                .font(.system(size: 14.5, weight: .semibold))
+                .foregroundStyle(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Text(task.dir)
+                .font(.system(size: 10.5, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    StatusPill(text: l10n.t("Archived", "已归档"), color: .green, systemImage: "archivebox.fill")
+                    StatusPill(text: task.record.priority, color: .secondary)
+                    if let branch = task.record.branch, !branch.isEmpty {
+                        StatusPill(text: branch, color: .blue, systemImage: "arrow.triangle.branch")
+                    }
+                    if let completed = task.record.completedAt, !completed.isEmpty {
+                        StatusPill(text: completed, color: .secondary)
+                    }
+                    if task.totalChecklistCount > 0 {
+                        StatusPill(
+                            text: l10n.t(
+                                "\(task.completedChecklistCount)/\(task.totalChecklistCount) checks",
+                                "\(task.completedChecklistCount)/\(task.totalChecklistCount) 项清单"
+                            ),
+                            color: .green
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     private func docPill(choice: DocChoice, label: String, icon: String) -> some View {
         let isSelected = selectedChoice == choice
         return Button {
@@ -798,10 +921,11 @@ private struct ArchivedTaskPreviewPane: View {
                     .font(.system(size: 10))
                 Text(label)
                     .font(.system(size: 11, weight: isSelected ? .semibold : .medium))
+                    .lineLimit(1)
             }
             .foregroundStyle(isSelected ? Color.primary : Color.secondary)
-            .padding(.horizontal, 9.5)
-            .padding(.vertical, 4.5)
+            .padding(.horizontal, 8.5)
+            .padding(.vertical, 4)
         }
         .buttonStyle(InteractiveSurfaceButtonStyle(
             isSelected: isSelected,
@@ -812,57 +936,76 @@ private struct ArchivedTaskPreviewPane: View {
         ))
     }
 
-    private func overviewBody(l10n: L10n) -> some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                if !task.record.description.isEmpty {
-                    MarkdownRendererView(markdown: task.record.description, isChinese: l10n.isChinese)
-                        .equatable()
+    @ViewBuilder
+    private func overviewContent(l10n: L10n) -> some View {
+        let linkHandler: (URL) -> Bool = { url in
+            store.handleMarkdownLink(
+                url,
+                baseFilePath: task.taskDirectoryPath,
+                currentTask: task,
+                onSelectTaskDoc: { targetRelPath in
+                    selectedChoice = .document(targetRelPath)
                 }
-                if !task.excerpt.isEmpty {
-                    WorkbenchCard(title: l10n.t("Summary Excerpt", "摘要"), systemImage: "text.alignleft") {
-                        MarkdownRendererView(markdown: task.excerpt, isChinese: l10n.isChinese)
-                            .equatable()
-                    }
-                }
-                if !task.checklist.isEmpty {
-                    WorkbenchCard(
-                        title: l10n.t(
-                            "Checklist (\(task.completedChecklistCount)/\(task.totalChecklistCount))",
-                            "清单 (\(task.completedChecklistCount)/\(task.totalChecklistCount))"
-                        ),
-                        systemImage: "checklist"
-                    ) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            ForEach(task.checklist.prefix(20)) { item in
-                                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                                    Image(systemName: item.isCompleted ? "checkmark.square.fill" : "square")
-                                        .font(.system(size: 11))
-                                        .foregroundStyle(item.isCompleted ? .green : .secondary)
-                                    InlineMarkdownText(item.text)
-                                        .font(.system(size: 11.5))
-                                        .foregroundStyle(item.isCompleted ? .secondary : .primary)
-                                }
-                            }
+            )
+        }
+
+        if !task.record.description.isEmpty {
+            MarkdownRendererView(
+                markdown: task.record.description,
+                isChinese: l10n.isChinese,
+                onOpenURL: linkHandler
+            )
+            .equatable()
+        }
+        if !task.excerpt.isEmpty {
+            WorkbenchCard(title: l10n.t("Summary Excerpt", "摘要"), systemImage: "text.alignleft") {
+                MarkdownRendererView(
+                    markdown: task.excerpt,
+                    isChinese: l10n.isChinese,
+                    onOpenURL: linkHandler
+                )
+                .equatable()
+            }
+        }
+        if !task.checklist.isEmpty {
+            WorkbenchCard(
+                title: l10n.t(
+                    "Checklist (\(task.completedChecklistCount)/\(task.totalChecklistCount))",
+                    "清单 (\(task.completedChecklistCount)/\(task.totalChecklistCount))"
+                ),
+                systemImage: "checklist"
+            ) {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(task.checklist.prefix(20)) { item in
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Image(systemName: item.isCompleted ? "checkmark.square.fill" : "square")
+                                .font(.system(size: 11))
+                                .foregroundStyle(item.isCompleted ? .green : .secondary)
+                            InlineMarkdownText(item.text)
+                                .font(.system(size: 11.5))
+                                .foregroundStyle(item.isCompleted ? .secondary : .primary)
                         }
                     }
                 }
-                if !task.record.notes.isEmpty {
-                    WorkbenchCard(title: l10n.t("Notes", "备注"), systemImage: "note.text") {
-                        MarkdownRendererView(markdown: task.record.notes, isChinese: l10n.isChinese)
-                            .equatable()
-                    }
-                }
-                if task.record.description.isEmpty && task.excerpt.isEmpty && task.record.notes.isEmpty && task.checklist.isEmpty {
-                    Text(l10n.t(
-                        "No summary metadata stored for this archived task. Select a document pill above to read full Markdown files.",
-                        "该归档任务暂无摘要信息，请点击上方文档标签查看完整 Markdown 文档。"
-                    ))
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                }
             }
-            .padding(14)
+        }
+        if !task.record.notes.isEmpty {
+            WorkbenchCard(title: l10n.t("Notes", "备注"), systemImage: "note.text") {
+                MarkdownRendererView(
+                    markdown: task.record.notes,
+                    isChinese: l10n.isChinese,
+                    onOpenURL: linkHandler
+                )
+                .equatable()
+            }
+        }
+        if task.record.description.isEmpty && task.excerpt.isEmpty && task.record.notes.isEmpty && task.checklist.isEmpty {
+            Text(l10n.t(
+                "No summary metadata stored for this archived task. Select a document pill above to read full Markdown files.",
+                "该归档任务暂无摘要信息，请点击上方文档标签查看完整 Markdown 文档。"
+            ))
+            .font(.system(size: 12))
+            .foregroundStyle(.secondary)
         }
     }
 }
