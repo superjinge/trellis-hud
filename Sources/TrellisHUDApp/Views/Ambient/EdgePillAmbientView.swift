@@ -1,30 +1,22 @@
+import AppKit
 import SwiftUI
 import TrellisCore
 
 /// Compact draggable macOS floating pill docked magnetically to a screen edge (Mode 2: Edge-Docked Pill).
-/// Never steals focus; click expands the Workbench anchored adjacent to the pill; drag snaps to nearest edge.
+/// Rendered strictly inside `ScreenGeometry.pillShadowPadding` transparent window margin with an adaptive
+/// opaque capsule surface (no borderless `Material` corner clipping), and dragged smoothly via AppKit screen-space
+/// mouse tracking in `FirstMouseHostingView` (zero ghosting trails).
 public struct EdgePillAmbientView: View {
     public let store: HUDStore
-    public let onTap: () -> Void
-    public let onDragDelta: (CGSize) -> Void
-    public let onDragEnd: () -> Void
 
     @State private var pulsePhase: Bool = false
-    @State private var isDragging: Bool = false
 
-    public init(
-        store: HUDStore,
-        onTap: @escaping () -> Void,
-        onDragDelta: @escaping (CGSize) -> Void,
-        onDragEnd: @escaping () -> Void
-    ) {
+    public init(store: HUDStore) {
         self.store = store
-        self.onTap = onTap
-        self.onDragDelta = onDragDelta
-        self.onDragEnd = onDragEnd
     }
 
     public var body: some View {
+        let loc = store.l10n
         HStack(spacing: 8) {
             statusDot
 
@@ -64,59 +56,53 @@ public struct EdgePillAmbientView: View {
                 }
                 .padding(.horizontal, 5)
                 .padding(.vertical, 2)
-                .background(Capsule().fill(.primary.opacity(0.08)))
+                .background(Capsule().fill(Color.primary.opacity(0.08)))
             }
         }
-        .padding(.horizontal, 11)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(.horizontal, 12)
+        .frame(width: ScreenGeometry.edgePillSize.width, height: ScreenGeometry.edgePillSize.height)
         .background(
             Capsule()
-                .fill(.ultraThinMaterial)
+                .fill(Color(nsColor: .windowBackgroundColor).opacity(0.95))
         )
         .overlay(
             Capsule()
-                .strokeBorder(borderColor, lineWidth: store.globalStatus.isAttentionRequired ? 1.1 : 0.75)
+                .strokeBorder(borderColor, lineWidth: store.globalStatus.isAttentionRequired ? 1.15 : 0.75)
         )
-        .shadow(color: .black.opacity(0.22), radius: 8, x: 0, y: 3)
-        .scaleEffect(isDragging ? 1.02 : 1.0)
+        .shadow(color: .black.opacity(0.16), radius: 5, x: 0, y: 2)
+        .padding(ScreenGeometry.pillShadowPadding)
         .contentShape(Capsule())
-        .gesture(
-            DragGesture(minimumDistance: 4, coordinateSpace: .global)
-                .onChanged { value in
-                    isDragging = true
-                    onDragDelta(value.translation)
-                }
-                .onEnded { _ in
-                    isDragging = false
-                    onDragEnd()
-                }
-        )
-        .simultaneousGesture(
-            TapGesture()
-                .onEnded {
-                    if !isDragging {
-                        onTap()
-                    }
-                }
-        )
         .contextMenu {
-            Button("Open Workbench (⌘⇧T)") {
+            Button(loc.t("Open Workbench (⌘⌥T)", "打开工作台 (⌘⌥T)")) {
                 store.expand()
             }
-            Button("Switch to Notch HUD (⌘⇧M)") {
+            Button(loc.t("Switch to Notch HUD (⌘⌥M)", "切换到刘海 HUD (⌘⌥M)")) {
                 store.setPresentationMode(.notch)
             }
             Divider()
-            Button("Snap Left") { store.setEdgeAnchor(.left) }
-            Button("Snap Right") { store.setEdgeAnchor(.right) }
-            Button("Snap Bottom Left") { store.setEdgeAnchor(.bottomLeft) }
-            Button("Snap Bottom Right") { store.setEdgeAnchor(.bottomRight) }
+            Button(loc.t("Snap Left", "吸附左侧")) { store.setEdgeAnchor(.left) }
+            Button(loc.t("Snap Right", "吸附右侧")) { store.setEdgeAnchor(.right) }
+            Button(loc.t("Snap Bottom Left", "吸附左下")) { store.setEdgeAnchor(.bottomLeft) }
+            Button(loc.t("Snap Bottom Right", "吸附右下")) { store.setEdgeAnchor(.bottomRight) }
             Divider()
-            Button("Refresh") { store.refreshAll() }
+            Button(loc.t("Refresh", "刷新")) { store.refreshAll() }
         }
         .onAppear {
+            syncBreathingAnimation()
+        }
+        .onChange(of: isBreathing) { _, _ in
+            syncBreathingAnimation()
+        }
+    }
+
+    private func syncBreathingAnimation() {
+        if isBreathing {
             withAnimation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true)) {
                 pulsePhase = true
+            }
+        } else {
+            withAnimation(.linear(duration: 0.15)) {
+                pulsePhase = false
             }
         }
     }
@@ -162,8 +148,8 @@ public struct EdgePillAmbientView: View {
 
     private var borderColor: Color {
         if store.globalStatus.isAttentionRequired {
-            return statusColor.opacity(0.75)
+            return statusColor.opacity(0.8)
         }
-        return Color.primary.opacity(0.16)
+        return Color(nsColor: .separatorColor).opacity(0.75)
     }
 }

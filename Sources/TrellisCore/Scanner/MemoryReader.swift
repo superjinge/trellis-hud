@@ -1,14 +1,24 @@
 import Foundation
+import os
 
 /// Reads `.trellis/workspace/<developer>/journal-*.md` files and queries cross-platform
-/// local AI session memory (`trellis mem` CLI + direct local readers for Antigravity, Claude, Codex, Pi).
+/// local AI session memory (`trellis mem` CLI + cached direct local readers for Antigravity, Claude, Codex, Pi).
 public enum MemoryReader: Sendable {
+    private static let maxEnumeratedFilesPerPlatform = 400
+    private static let maxHeaderCacheEntries = 500
+
+    private struct CachedSessionHeader: Sendable {
+        let mtime: Date
+        let item: MemorySessionItem
+    }
+
+    private static let headerCache = OSAllocatedUnfairLock(initialState: [String: CachedSessionHeader]())
+
     // MARK: - Workspace Journals
 
     /// Scans `<projectPath>/.trellis/workspace/<developer>/journal-*.md` into `[WorkspaceJournal]`.
     public static func scanJournals(projectPath: String) -> [WorkspaceJournal] {
-        let normalizedProject = URL(fileURLWithPath: (projectPath as NSString).expandingTildeInPath)
-            .standardizedFileURL.path
+        let normalizedProject = ConfigStore.normalizePath(projectPath)
         let workspaceDir = (normalizedProject as NSString).appendingPathComponent(".trellis/workspace")
         let fm = FileManager.default
 
@@ -60,16 +70,14 @@ public enum MemoryReader: Sendable {
     // MARK: - Cross-Platform Session Memory
 
     /// Scans recent local AI session files across Antigravity, Claude Code, Codex, and Pi.
-    /// Optionally filters to sessions associated with `projectPath`.
+    /// Uses prefetched `contentModificationDateKey` attributes and a bounded `(path, mtime)` header cache.
     public static func scanLocalSessions(
         projectPath: String? = nil,
         limit: Int = 40,
         homeDirectory: String? = nil
     ) -> [MemorySessionItem] {
         let home = homeDirectory ?? NSHomeDirectory()
-        let normalizedTarget = projectPath.map {
-            URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath).standardizedFileURL.path
-        }
+        let normalizedTarget = projectPath.map { ConfigStore.normalizePath($0) }
 
         var items: [MemorySessionItem] = []
         items.append(contentsOf: scanAntigravitySessions(home: home, targetCwd: normalizedTarget, limit: limit))
@@ -86,7 +94,7 @@ public enum MemoryReader: Sendable {
     }
 
     /// Searches memory sessions using multi-token case-insensitive AND matching.
-    /// Prefers `trellis mem search --json` when available on PATH, falling back to fast direct local scanning.
+    /// Optionally prefers `trellis mem search --json` when available on PATH, falling back to direct local scanning.
     public static func searchMemory(
         query: String,
         projectPath: String? = nil,
@@ -148,7 +156,7 @@ public enum MemoryReader: Sendable {
     }
 
     /// Optional CLI bridge to `trellis mem list --json` / `trellis mem search <query> --json`.
-    /// Returns `nil` when `trellis` is not installed or exits non-zero.
+    /// Uses deadlock-free `SubprocessRunner` and probes Homebrew, `~/.local`, `~/.npm-global`, `~/.nvm`, and `PATH`.
     public static func queryTrellisMemCLI(
         query: String? = nil,
         projectPath: String? = nil,
@@ -170,12 +178,35 @@ public enum MemoryReader: Sendable {
         }
         args.append(contentsOf: ["--limit", String(limit), "--json"])
 
-        guard let output = runCommand(executable: trellisBin, args: args, timeoutSeconds: timeoutSeconds),
-              let data = output.data(using: .utf8),
+        let result = SubprocessRunner.run(
+            executable: trellisBin,
+            arguments: args,
+            timeoutSeconds: timeoutSeconds
+        )
+        guard result.succeeded,
+              let data = result.stdout.data(using: .utf8),
               let parsed = try? JSONSerialization.jsonObject(with: data)
         else { return nil }
 
         return decodeTrellisMemJSON(parsed)
+    }
+
+    // MARK: - Header Cache
+
+    private static func cachedHeader(path: String, mtime: Date) -> MemorySessionItem? {
+        headerCache.withLock { cache in
+            guard let entry = cache[path], entry.mtime == mtime else { return nil }
+            return entry.item
+        }
+    }
+
+    private static func storeHeader(path: String, mtime: Date, item: MemorySessionItem) {
+        headerCache.withLock { cache in
+            if cache.count >= maxHeaderCacheEntries {
+                cache.removeAll(keepingCapacity: true)
+            }
+            cache[path] = CachedSessionHeader(mtime: mtime, item: item)
+        }
     }
 
     // MARK: - Local Platform Adapters
@@ -198,14 +229,24 @@ public enum MemoryReader: Sendable {
         var seenIds = Set<String>()
 
         for root in roots {
-            guard let entries = try? fm.contentsOfDirectory(atPath: root) else { continue }
-            for convId in entries where !convId.hasPrefix(".") {
-                let transcript = (((root as NSString)
-                    .appendingPathComponent(convId) as NSString)
-                    .appendingPathComponent(".system_generated/logs/transcript.jsonl"))
-                guard fm.fileExists(atPath: transcript), seenIds.insert(convId).inserted else { continue }
-                let mtime = ((try? fm.attributesOfItem(atPath: transcript)[.modificationDate]) as? Date) ?? .distantPast
-                candidates.append((convId, transcript, mtime))
+            let rootURL = URL(fileURLWithPath: root, isDirectory: true)
+            guard let dirURLs = try? fm.contentsOfDirectory(
+                at: rootURL,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            ) else { continue }
+
+            for convURL in dirURLs {
+                if candidates.count >= maxEnumeratedFilesPerPlatform { break }
+                let convId = convURL.lastPathComponent
+                let transcriptURL = convURL
+                    .appendingPathComponent(".system_generated/logs/transcript.jsonl", isDirectory: false)
+                guard seenIds.insert(convId).inserted,
+                      let values = try? transcriptURL.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey]),
+                      values.isRegularFile == true
+                else { continue }
+                let mtime = values.contentModificationDate ?? .distantPast
+                candidates.append((convId, transcriptURL.path, mtime))
             }
         }
 
@@ -213,56 +254,52 @@ public enum MemoryReader: Sendable {
         var items: [MemorySessionItem] = []
 
         for cand in candidates.prefix(max(limit * 3, 60)) {
-            guard let head = readPrefixText(path: cand.path, maxBytes: 48 * 1024) else { continue }
-            var createdAt: Date?
-            var inferredCwd: String?
-            var title: String?
-            var excerpts: [MemoryExcerpt] = []
+            let item: MemorySessionItem
+            if let hit = cachedHeader(path: cand.path, mtime: cand.mtime) {
+                item = hit
+            } else {
+                guard let head = readPrefixText(path: cand.path, maxBytes: 48 * 1024) else { continue }
+                var createdAt: Date?
+                var inferredCwd: String?
+                var title: String?
+                var excerpts: [MemoryExcerpt] = []
 
-            for line in head.components(separatedBy: .newlines) where !line.isEmpty {
-                guard let data = line.data(using: .utf8),
-                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-                else { continue }
+                for line in head.components(separatedBy: .newlines) where !line.isEmpty {
+                    guard let data = line.data(using: .utf8),
+                          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                    else { continue }
 
-                if createdAt == nil, let ts = obj["created_at"] as? String {
-                    createdAt = parseISO8601(ts)
-                }
-                if inferredCwd == nil {
-                    inferredCwd = (obj["cwd"] as? String)
-                        ?? (obj["workspace_path"] as? String)
-                        ?? (obj["workspacePaths"] as? [String])?.first
-                        ?? inferCwdFromAntigravityToolCalls(obj["tool_calls"])
-                }
-                if let type = obj["type"] as? String, let content = obj["content"] as? String {
-                    if type == "USER_INPUT" {
-                        let cleaned = extractUserRequestText(content)
-                        if !cleaned.isEmpty {
-                            if title == nil { title = firstLineSummary(cleaned) }
-                            if excerpts.count < 2 {
-                                excerpts.append(MemoryExcerpt(role: "user", snippet: String(cleaned.prefix(200))))
+                    if createdAt == nil, let ts = obj["created_at"] as? String {
+                        createdAt = ISO8601FastParser.parse(ts)
+                    }
+                    if inferredCwd == nil {
+                        inferredCwd = (obj["cwd"] as? String)
+                            ?? (obj["workspace_path"] as? String)
+                            ?? (obj["workspacePaths"] as? [String])?.first
+                            ?? inferCwdFromAntigravityToolCalls(obj["tool_calls"])
+                    }
+                    if let type = obj["type"] as? String, let content = obj["content"] as? String {
+                        if type == "USER_INPUT" {
+                            let cleaned = extractUserRequestText(content)
+                            if !cleaned.isEmpty {
+                                if title == nil { title = firstLineSummary(cleaned) }
+                                if excerpts.count < 2 {
+                                    excerpts.append(MemoryExcerpt(role: "user", snippet: String(cleaned.prefix(200))))
+                                }
+                            }
+                        } else if type == "PLANNER_RESPONSE", excerpts.count < 2 {
+                            let cleaned = content.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !cleaned.isEmpty {
+                                excerpts.append(MemoryExcerpt(role: "assistant", snippet: String(cleaned.prefix(200))))
                             }
                         }
-                    } else if type == "PLANNER_RESPONSE", excerpts.count < 2 {
-                        let cleaned = content.trimmingCharacters(in: .whitespacesAndNewlines)
-                        if !cleaned.isEmpty {
-                            excerpts.append(MemoryExcerpt(role: "assistant", snippet: String(cleaned.prefix(200))))
-                        }
+                    }
+                    if createdAt != nil && inferredCwd != nil && title != nil && excerpts.count >= 2 {
+                        break
                     }
                 }
-                if createdAt != nil && inferredCwd != nil && title != nil && excerpts.count >= 2 {
-                    break
-                }
-            }
 
-            if let targetCwd, let inferredCwd, !pathsMatch(inferredCwd, targetCwd) {
-                continue
-            }
-            if targetCwd != nil && inferredCwd == nil {
-                continue
-            }
-
-            items.append(
-                MemorySessionItem(
+                item = MemorySessionItem(
                     id: cand.id,
                     platform: .antigravity,
                     title: title,
@@ -272,7 +309,14 @@ public enum MemoryReader: Sendable {
                     filePath: cand.path,
                     excerpts: excerpts
                 )
-            )
+                storeHeader(path: cand.path, mtime: cand.mtime, item: item)
+            }
+
+            if let targetCwd {
+                guard let cwd = item.cwd, pathsMatch(cwd, targetCwd) else { continue }
+            }
+
+            items.append(item)
             if items.count >= limit { break }
         }
 
@@ -285,28 +329,36 @@ public enum MemoryReader: Sendable {
         limit: Int
     ) -> [MemorySessionItem] {
         let fm = FileManager.default
-        let projectsRoot = (home as NSString).appendingPathComponent(".claude/projects")
-        guard fm.fileExists(atPath: projectsRoot) else { return [] }
+        let projectsRoot = URL(fileURLWithPath: (home as NSString).appendingPathComponent(".claude/projects"), isDirectory: true)
+        guard fm.fileExists(atPath: projectsRoot.path) else { return [] }
 
-        let projectDirs: [String]
+        let projectDirs: [URL]
         if let targetCwd {
             let sanitized = sanitizeClaudeCwd(targetCwd)
-            let direct = (projectsRoot as NSString).appendingPathComponent(sanitized)
-            projectDirs = fm.fileExists(atPath: direct) ? [direct] : []
+            let direct = projectsRoot.appendingPathComponent(sanitized, isDirectory: true)
+            projectDirs = fm.fileExists(atPath: direct.path) ? [direct] : []
         } else {
-            let entries = (try? fm.contentsOfDirectory(atPath: projectsRoot)) ?? []
-            projectDirs = entries.filter { !$0.hasPrefix(".") }.map {
-                (projectsRoot as NSString).appendingPathComponent($0)
-            }
+            projectDirs = (try? fm.contentsOfDirectory(
+                at: projectsRoot,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            )) ?? []
         }
 
         var files: [(id: String, path: String, mtime: Date)] = []
         for dir in projectDirs {
-            guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { continue }
-            for file in entries where file.hasSuffix(".jsonl") {
-                let full = (dir as NSString).appendingPathComponent(file)
-                let mtime = ((try? fm.attributesOfItem(atPath: full)[.modificationDate]) as? Date) ?? .distantPast
-                files.append(((file as NSString).deletingPathExtension, full, mtime))
+            if files.count >= maxEnumeratedFilesPerPlatform { break }
+            guard let entries = try? fm.contentsOfDirectory(
+                at: dir,
+                includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
+                options: [.skipsHiddenFiles]
+            ) else { continue }
+            for fileURL in entries where fileURL.pathExtension == "jsonl" {
+                if files.count >= maxEnumeratedFilesPerPlatform { break }
+                let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey])
+                guard values?.isRegularFile == true else { continue }
+                let mtime = values?.contentModificationDate ?? .distantPast
+                files.append((fileURL.deletingPathExtension().lastPathComponent, fileURL.path, mtime))
             }
         }
 
@@ -314,48 +366,56 @@ public enum MemoryReader: Sendable {
         var items: [MemorySessionItem] = []
 
         for entry in files.prefix(max(limit * 2, 40)) {
-            guard let head = readPrefixText(path: entry.path, maxBytes: 32 * 1024) else { continue }
-            var cwd: String? = targetCwd
-            var createdAt: Date?
-            var title: String?
-            var excerpts: [MemoryExcerpt] = []
+            let item: MemorySessionItem
+            if let hit = cachedHeader(path: entry.path, mtime: entry.mtime) {
+                item = hit
+            } else {
+                guard let head = readPrefixText(path: entry.path, maxBytes: 32 * 1024) else { continue }
+                var cwd: String?
+                var createdAt: Date?
+                var title: String?
+                var excerpts: [MemoryExcerpt] = []
 
-            for line in head.components(separatedBy: .newlines) where !line.isEmpty {
-                guard let data = line.data(using: .utf8),
-                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-                else { continue }
+                for line in head.components(separatedBy: .newlines) where !line.isEmpty {
+                    guard let data = line.data(using: .utf8),
+                          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                    else { continue }
 
-                if cwd == nil, let c = obj["cwd"] as? String, !c.isEmpty { cwd = c }
-                if createdAt == nil, let ts = obj["timestamp"] as? String { createdAt = parseISO8601(ts) }
+                    if cwd == nil, let c = obj["cwd"] as? String, !c.isEmpty { cwd = c }
+                    if createdAt == nil, let ts = obj["timestamp"] as? String {
+                        createdAt = ISO8601FastParser.parse(ts)
+                    }
 
-                if (obj["type"] as? String) == "user",
-                   let msg = obj["message"] as? [String: Any],
-                   let text = msg["content"] as? String
-                {
-                    let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !cleaned.isEmpty {
-                        if title == nil { title = firstLineSummary(cleaned) }
-                        if excerpts.isEmpty {
-                            excerpts.append(MemoryExcerpt(role: "user", snippet: String(cleaned.prefix(200))))
+                    if (obj["type"] as? String) == "user",
+                       let msg = obj["message"] as? [String: Any],
+                       let text = msg["content"] as? String
+                    {
+                        let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !cleaned.isEmpty {
+                            if title == nil { title = firstLineSummary(cleaned) }
+                            if excerpts.isEmpty {
+                                excerpts.append(MemoryExcerpt(role: "user", snippet: String(cleaned.prefix(200))))
+                            }
                         }
                     }
+                    if cwd != nil && createdAt != nil && title != nil { break }
                 }
-                if cwd != nil && createdAt != nil && title != nil { break }
-            }
 
-            if let targetCwd, let cwd, !pathsMatch(cwd, targetCwd) { continue }
-            items.append(
-                MemorySessionItem(
+                item = MemorySessionItem(
                     id: entry.id,
                     platform: .claude,
                     title: title,
-                    cwd: cwd,
+                    cwd: cwd ?? targetCwd,
                     createdAt: createdAt ?? entry.mtime,
                     updatedAt: entry.mtime,
                     filePath: entry.path,
                     excerpts: excerpts
                 )
-            )
+                storeHeader(path: entry.path, mtime: entry.mtime, item: item)
+            }
+
+            if let targetCwd, let cwd = item.cwd, !pathsMatch(cwd, targetCwd) { continue }
+            items.append(item)
             if items.count >= limit { break }
         }
         return items
@@ -367,66 +427,70 @@ public enum MemoryReader: Sendable {
         limit: Int
     ) -> [MemorySessionItem] {
         let fm = FileManager.default
-        let sessionsRoot = (home as NSString).appendingPathComponent(".codex/sessions")
-        guard let enumerator = fm.enumerator(atPath: sessionsRoot) else { return [] }
+        let sessionsRoot = URL(fileURLWithPath: (home as NSString).appendingPathComponent(".codex/sessions"), isDirectory: true)
+        guard let enumerator = fm.enumerator(
+            at: sessionsRoot,
+            includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
 
         var files: [(path: String, mtime: Date)] = []
-        for case let rel as String in enumerator {
-            guard rel.hasSuffix(".jsonl"), (rel as NSString).lastPathComponent.hasPrefix("rollout-") else {
+        for case let fileURL as URL in enumerator {
+            guard fileURL.pathExtension == "jsonl", fileURL.lastPathComponent.hasPrefix("rollout-") else {
                 continue
             }
-            let full = (sessionsRoot as NSString).appendingPathComponent(rel)
-            let mtime = ((try? fm.attributesOfItem(atPath: full)[.modificationDate]) as? Date) ?? .distantPast
-            files.append((full, mtime))
+            let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey])
+            guard values?.isRegularFile == true else { continue }
+            files.append((fileURL.path, values?.contentModificationDate ?? .distantPast))
+            if files.count >= maxEnumeratedFilesPerPlatform { break }
         }
 
         files.sort { $0.mtime > $1.mtime }
         var items: [MemorySessionItem] = []
 
         for entry in files.prefix(max(limit * 2, 40)) {
-            guard let head = readPrefixText(path: entry.path, maxBytes: 32 * 1024) else { continue }
-            var sessionId = (entry.path as NSString).lastPathComponent
-            var cwd: String?
-            var createdAt: Date?
-            var title: String?
-            var excerpts: [MemoryExcerpt] = []
+            let item: MemorySessionItem
+            if let hit = cachedHeader(path: entry.path, mtime: entry.mtime) {
+                item = hit
+            } else {
+                guard let head = readPrefixText(path: entry.path, maxBytes: 32 * 1024) else { continue }
+                var sessionId = (entry.path as NSString).lastPathComponent
+                var cwd: String?
+                var createdAt: Date?
+                var title: String?
+                var excerpts: [MemoryExcerpt] = []
 
-            for line in head.components(separatedBy: .newlines) where !line.isEmpty {
-                guard let data = line.data(using: .utf8),
-                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-                else { continue }
+                for line in head.components(separatedBy: .newlines) where !line.isEmpty {
+                    guard let data = line.data(using: .utf8),
+                          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                    else { continue }
 
-                if createdAt == nil, let ts = obj["timestamp"] as? String {
-                    createdAt = parseISO8601(ts)
-                }
-                if let payload = obj["payload"] as? [String: Any] {
-                    if let id = payload["id"] as? String, !id.isEmpty { sessionId = id }
-                    if cwd == nil, let c = payload["cwd"] as? String, !c.isEmpty { cwd = c }
-                    if (payload["type"] as? String) == "message",
-                       (payload["role"] as? String) == "user",
-                       let parts = payload["content"] as? [[String: Any]]
-                    {
-                        let text = parts.compactMap { part -> String? in
-                            guard (part["type"] as? String) == "input_text" else { return nil }
-                            return part["text"] as? String
-                        }.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-                        if !text.isEmpty {
-                            if title == nil { title = firstLineSummary(text) }
-                            if excerpts.isEmpty {
-                                excerpts.append(MemoryExcerpt(role: "user", snippet: String(text.prefix(200))))
+                    if createdAt == nil, let ts = obj["timestamp"] as? String {
+                        createdAt = ISO8601FastParser.parse(ts)
+                    }
+                    if let payload = obj["payload"] as? [String: Any] {
+                        if let id = payload["id"] as? String, !id.isEmpty { sessionId = id }
+                        if cwd == nil, let c = payload["cwd"] as? String, !c.isEmpty { cwd = c }
+                        if (payload["type"] as? String) == "message",
+                           (payload["role"] as? String) == "user",
+                           let parts = payload["content"] as? [[String: Any]]
+                        {
+                            let text = parts.compactMap { part -> String? in
+                                guard (part["type"] as? String) == "input_text" else { return nil }
+                                return part["text"] as? String
+                            }.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !text.isEmpty {
+                                if title == nil { title = firstLineSummary(text) }
+                                if excerpts.isEmpty {
+                                    excerpts.append(MemoryExcerpt(role: "user", snippet: String(text.prefix(200))))
+                                }
                             }
                         }
                     }
+                    if cwd != nil && title != nil { break }
                 }
-                if cwd != nil && title != nil { break }
-            }
 
-            if let targetCwd {
-                guard let cwd, pathsMatch(cwd, targetCwd) else { continue }
-            }
-
-            items.append(
-                MemorySessionItem(
+                item = MemorySessionItem(
                     id: sessionId,
                     platform: .codex,
                     title: title,
@@ -436,7 +500,14 @@ public enum MemoryReader: Sendable {
                     filePath: entry.path,
                     excerpts: excerpts
                 )
-            )
+                storeHeader(path: entry.path, mtime: entry.mtime, item: item)
+            }
+
+            if let targetCwd {
+                guard let cwd = item.cwd, pathsMatch(cwd, targetCwd) else { continue }
+            }
+
+            items.append(item)
             if items.count >= limit { break }
         }
         return items
@@ -448,48 +519,52 @@ public enum MemoryReader: Sendable {
         limit: Int
     ) -> [MemorySessionItem] {
         let fm = FileManager.default
-        let sessionsRoot = (home as NSString).appendingPathComponent(".pi/agent/sessions")
-        guard let enumerator = fm.enumerator(atPath: sessionsRoot) else { return [] }
+        let sessionsRoot = URL(fileURLWithPath: (home as NSString).appendingPathComponent(".pi/agent/sessions"), isDirectory: true)
+        guard let enumerator = fm.enumerator(
+            at: sessionsRoot,
+            includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
 
         var files: [(path: String, mtime: Date)] = []
-        for case let rel as String in enumerator where rel.hasSuffix(".jsonl") {
-            let full = (sessionsRoot as NSString).appendingPathComponent(rel)
-            let mtime = ((try? fm.attributesOfItem(atPath: full)[.modificationDate]) as? Date) ?? .distantPast
-            files.append((full, mtime))
+        for case let fileURL as URL in enumerator where fileURL.pathExtension == "jsonl" {
+            let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey])
+            guard values?.isRegularFile == true else { continue }
+            files.append((fileURL.path, values?.contentModificationDate ?? .distantPast))
+            if files.count >= maxEnumeratedFilesPerPlatform { break }
         }
 
         files.sort { $0.mtime > $1.mtime }
         var items: [MemorySessionItem] = []
 
         for entry in files.prefix(max(limit * 2, 40)) {
-            guard let head = readPrefixText(path: entry.path, maxBytes: 24 * 1024) else { continue }
-            let lines = head.components(separatedBy: .newlines).filter { !$0.isEmpty }
-            guard let firstLine = lines.first,
-                  let firstData = firstLine.data(using: .utf8),
-                  let header = try? JSONSerialization.jsonObject(with: firstData) as? [String: Any],
-                  (header["type"] as? String) == "session"
-            else { continue }
-
-            let id = (header["id"] as? String) ?? ((entry.path as NSString).lastPathComponent as NSString).deletingPathExtension
-            let cwd = header["cwd"] as? String
-            let createdAt = (header["timestamp"] as? String).flatMap(parseISO8601) ?? entry.mtime
-
-            if let targetCwd {
-                guard let cwd, pathsMatch(cwd, targetCwd) else { continue }
-            }
-
-            var title: String?
-            for line in lines.dropFirst() {
-                guard let data = line.data(using: .utf8),
-                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      (obj["type"] as? String) == "session_info",
-                      let name = obj["name"] as? String, !name.isEmpty
+            let item: MemorySessionItem
+            if let hit = cachedHeader(path: entry.path, mtime: entry.mtime) {
+                item = hit
+            } else {
+                guard let head = readPrefixText(path: entry.path, maxBytes: 24 * 1024) else { continue }
+                let lines = head.components(separatedBy: .newlines).filter { !$0.isEmpty }
+                guard let firstLine = lines.first,
+                      let firstData = firstLine.data(using: .utf8),
+                      let header = try? JSONSerialization.jsonObject(with: firstData) as? [String: Any],
+                      (header["type"] as? String) == "session"
                 else { continue }
-                title = name
-            }
 
-            items.append(
-                MemorySessionItem(
+                let id = (header["id"] as? String) ?? ((entry.path as NSString).lastPathComponent as NSString).deletingPathExtension
+                let cwd = header["cwd"] as? String
+                let createdAt = (header["timestamp"] as? String).flatMap(ISO8601FastParser.parse) ?? entry.mtime
+
+                var title: String?
+                for line in lines.dropFirst() {
+                    guard let data = line.data(using: .utf8),
+                          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          (obj["type"] as? String) == "session_info",
+                          let name = obj["name"] as? String, !name.isEmpty
+                    else { continue }
+                    title = name
+                }
+
+                item = MemorySessionItem(
                     id: id,
                     platform: .pi,
                     title: title,
@@ -498,7 +573,14 @@ public enum MemoryReader: Sendable {
                     updatedAt: entry.mtime,
                     filePath: entry.path
                 )
-            )
+                storeHeader(path: entry.path, mtime: entry.mtime, item: item)
+            }
+
+            if let targetCwd {
+                guard let cwd = item.cwd, pathsMatch(cwd, targetCwd) else { continue }
+            }
+
+            items.append(item)
             if items.count >= limit { break }
         }
         return items
@@ -642,28 +724,32 @@ public enum MemoryReader: Sendable {
     }
 
     private static func pathsMatch(_ a: String, _ b: String) -> Bool {
-        let na = URL(fileURLWithPath: a).standardizedFileURL.path
-        let nb = URL(fileURLWithPath: b).standardizedFileURL.path
+        let na = ConfigStore.normalizePath(a)
+        let nb = ConfigStore.normalizePath(b)
         return na == nb || na.hasPrefix(nb + "/")
-    }
-
-    private static func parseISO8601(_ value: String) -> Date? {
-        let f1 = ISO8601DateFormatter()
-        f1.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = f1.date(from: value) { return d }
-        let f2 = ISO8601DateFormatter()
-        f2.formatOptions = [.withInternetDateTime]
-        return f2.date(from: value)
     }
 
     private static func resolveTrellisExecutable() -> String? {
         let fm = FileManager.default
-        let candidates = [
+        let home = NSHomeDirectory()
+        var candidates = [
             "/opt/homebrew/bin/trellis",
             "/usr/local/bin/trellis",
-            (NSHomeDirectory() as NSString).appendingPathComponent(".local/bin/trellis"),
-            (NSHomeDirectory() as NSString).appendingPathComponent(".npm-global/bin/trellis"),
+            (home as NSString).appendingPathComponent(".local/bin/trellis"),
+            (home as NSString).appendingPathComponent(".npm-global/bin/trellis"),
         ]
+
+        // Probe nvm-managed Node installations (`~/.nvm/versions/node/<ver>/bin/trellis`), newest first.
+        let nvmNodeDir = (home as NSString).appendingPathComponent(".nvm/versions/node")
+        if let versions = try? fm.contentsOfDirectory(atPath: nvmNodeDir) {
+            for version in versions.sorted().reversed() where !version.hasPrefix(".") {
+                let candidate = (((nvmNodeDir as NSString)
+                    .appendingPathComponent(version) as NSString)
+                    .appendingPathComponent("bin/trellis"))
+                candidates.append(candidate)
+            }
+        }
+
         for path in candidates where fm.isExecutableFile(atPath: path) {
             return path
         }
@@ -674,34 +760,6 @@ public enum MemoryReader: Sendable {
             }
         }
         return nil
-    }
-
-    private static func runCommand(executable: String, args: [String], timeoutSeconds: Double) -> String? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = args
-        let stdout = Pipe()
-        process.standardOutput = stdout
-        process.standardError = Pipe()
-
-        let sem = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in sem.signal() }
-
-        do {
-            try process.run()
-        } catch {
-            return nil
-        }
-
-        if sem.wait(timeout: .now() + timeoutSeconds) == .timedOut {
-            process.terminate()
-            _ = sem.wait(timeout: .now() + 0.5)
-            return nil
-        }
-
-        guard process.terminationStatus == 0 else { return nil }
-        let data = stdout.fileHandleForReading.readDataToEndOfFile()
-        return String(data: data, encoding: .utf8)
     }
 
     private static func decodeTrellisMemJSON(_ json: Any) -> [MemorySessionItem] {
@@ -723,8 +781,8 @@ public enum MemoryReader: Sendable {
             let title = sessionObj["title"] as? String
             let cwd = sessionObj["cwd"] as? String
             let filePath = (sessionObj["filePath"] as? String) ?? ""
-            let createdAt = (sessionObj["created"] as? String).flatMap(parseISO8601)
-            let updatedAt = (sessionObj["updated"] as? String).flatMap(parseISO8601)
+            let createdAt = (sessionObj["created"] as? String).flatMap(ISO8601FastParser.parse)
+            let updatedAt = (sessionObj["updated"] as? String).flatMap(ISO8601FastParser.parse)
             let score = row["score"] as? Double
             let hitCount = (row["hitCount"] as? Int) ?? (row["matchCount"] as? Int) ?? 0
             let rawExcerpts = (row["excerpts"] as? [[String: Any]]) ?? []

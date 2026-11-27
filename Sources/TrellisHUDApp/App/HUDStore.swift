@@ -14,12 +14,7 @@ public enum WorkbenchTab: String, CaseIterable, Identifiable, Sendable {
     public var id: String { rawValue }
 
     public var title: String {
-        switch self {
-        case .flow: return "Flow"
-        case .live: return "Live"
-        case .docsSpecs: return "Docs & Specs"
-        case .history: return "History"
-        }
+        L10n(language: .system).tabTitle(self)
     }
 
     public var systemImage: String {
@@ -30,6 +25,13 @@ public enum WorkbenchTab: String, CaseIterable, Identifiable, Sendable {
         case .history: return "clock.arrow.circlepath"
         }
     }
+}
+
+public enum DocsSubMode: String, CaseIterable, Identifiable, Sendable {
+    case taskDocs
+    case projectSpecs
+
+    public var id: String { rawValue }
 }
 
 public struct StatusToast: Equatable, Identifiable, Sendable {
@@ -79,7 +81,7 @@ public struct HUDDataProvider: Sendable {
     public var scanActiveTasks: @Sendable (String) -> [TaskSnapshot]
     public var scanArchivedTasks: @Sendable (String) -> [TaskSnapshot]
     public var loadDocument: @Sendable (String, String) -> String?
-    public var scanSpecsAndGit: @Sendable (String) -> ([SpecDocument], GitStatusSnapshot?)
+    public var scanSpecsAndGit: @Sendable (String, [String]) -> ([SpecDocument], GitStatusSnapshot?)
     public var scanChannels: @Sendable () -> [ChannelInfo]
     public var scanJournals: @Sendable (String) -> [WorkspaceJournal]
     public var searchMemory: @Sendable (String, String?) -> [MemorySessionItem]
@@ -88,30 +90,19 @@ public struct HUDDataProvider: Sendable {
     public var configureHook: @Sendable (AgentKind, Bool) throws -> AgentHookStatusInfo
 
     public init(
-        loadConfig: @escaping @Sendable () -> HUDConfig = { HUDStore.loadConfigFallback() },
-        saveConfig: @escaping @Sendable (HUDConfig) throws -> Void = { try HUDStore.saveConfigFallback($0) },
-        discoverProjects: @escaping @Sendable ([String], [String]) -> [ProjectInfo] = { _, _ in [] },
-        scanActiveTasks: @escaping @Sendable (String) -> [TaskSnapshot] = { _ in [] },
-        scanArchivedTasks: @escaping @Sendable (String) -> [TaskSnapshot] = { _ in [] },
-        loadDocument: @escaping @Sendable (String, String) -> String? = { HUDStore.loadDocumentFallback(taskDir: $0, relativePath: $1) },
-        scanSpecsAndGit: @escaping @Sendable (String) -> ([SpecDocument], GitStatusSnapshot?) = { _ in ([], nil) },
-        scanChannels: @escaping @Sendable () -> [ChannelInfo] = { [] },
-        scanJournals: @escaping @Sendable (String) -> [WorkspaceJournal] = { _ in [] },
-        searchMemory: @escaping @Sendable (String, String?) -> [MemorySessionItem] = { _, _ in [] },
-        runTaskAction: @escaping @Sendable (ActionKind, String, String) async -> ActionResult = { action, _, _ in
-            ActionResult(success: false, action: action, exitCode: 1, message: "Action runner not connected yet")
-        },
-        getHookStatuses: @escaping @Sendable () -> [AgentHookStatusInfo] = { HUDStore.defaultHookStatuses() },
-        configureHook: @escaping @Sendable (AgentKind, Bool) throws -> AgentHookStatusInfo = { agent, enabled in
-            AgentHookStatusInfo(
-                agent: agent,
-                installed: enabled,
-                configExists: false,
-                configPath: "",
-                isSupported: agent != .antigravity,
-                detail: "Hook installer wiring pending"
-            )
-        }
+        loadConfig: @escaping @Sendable () -> HUDConfig,
+        saveConfig: @escaping @Sendable (HUDConfig) throws -> Void,
+        discoverProjects: @escaping @Sendable ([String], [String]) -> [ProjectInfo],
+        scanActiveTasks: @escaping @Sendable (String) -> [TaskSnapshot],
+        scanArchivedTasks: @escaping @Sendable (String) -> [TaskSnapshot],
+        loadDocument: @escaping @Sendable (String, String) -> String?,
+        scanSpecsAndGit: @escaping @Sendable (String, [String]) -> ([SpecDocument], GitStatusSnapshot?),
+        scanChannels: @escaping @Sendable () -> [ChannelInfo],
+        scanJournals: @escaping @Sendable (String) -> [WorkspaceJournal],
+        searchMemory: @escaping @Sendable (String, String?) -> [MemorySessionItem],
+        runTaskAction: @escaping @Sendable (ActionKind, String, String) async -> ActionResult,
+        getHookStatuses: @escaping @Sendable () -> [AgentHookStatusInfo],
+        configureHook: @escaping @Sendable (AgentKind, Bool) throws -> AgentHookStatusInfo
     ) {
         self.loadConfig = loadConfig
         self.saveConfig = saveConfig
@@ -166,12 +157,10 @@ public struct HUDDataProvider: Sendable {
             loadDocument: { taskDir, relativePath in
                 ProjectScanner.loadTaskDocument(taskDir: taskDir, relativePath: relativePath)
             },
-            scanSpecsAndGit: { projectPath in
-                let tasks = ProjectScanner.scanActiveTasks(projectPath: projectPath)
-                let refs = tasks.flatMap(\.artifacts.specRefs)
+            scanSpecsAndGit: { projectPath, specRefs in
                 let report = SpecAndGitAnalyzer.analyzeGovernance(
                     projectPath: projectPath,
-                    referencedSpecPaths: refs
+                    referencedSpecPaths: specRefs
                 )
                 return (report.specs, report.gitStatus)
             },
@@ -204,7 +193,7 @@ public struct HUDDataProvider: Sendable {
                         configExists: st.configExists,
                         configPath: st.configPath,
                         isSupported: true,
-                        detail: st.agent == .antigravity ? "Hooks + automatic trellis mem" : nil
+                        detail: st.agent == .antigravity ? "Hooks + trellis mem" : nil
                     )
                 }
             },
@@ -217,7 +206,7 @@ public struct HUDDataProvider: Sendable {
                     configExists: st.configExists,
                     configPath: st.configPath,
                     isSupported: true,
-                    detail: st.agent == .antigravity ? "Hooks + automatic trellis mem" : nil
+                    detail: st.agent == .antigravity ? "Hooks + trellis mem" : nil
                 )
             }
         )
@@ -236,7 +225,16 @@ public final class HUDStore {
     public var isHovered: Bool = false
     public var isSettingsOpen: Bool = false
     public var selectedTab: WorkbenchTab = .flow
+    public var docsSubMode: DocsSubMode = .taskDocs
     public var showMenuBarIcon: Bool
+
+    public var language: AppLanguage {
+        config.language
+    }
+
+    public var l10n: L10n {
+        L10n(language: config.language)
+    }
 
     public var presentationMode: PresentationMode {
         config.presentationMode
@@ -279,6 +277,7 @@ public final class HUDStore {
     public var journals: [WorkspaceJournal] = []
     public var memorySessions: [MemorySessionItem] = []
     public var historyQuery: String = ""
+    public var isLoadingHistory: Bool = false
 
     // MARK: Live Runtime & Channels (Tab 2: Live + Ambient)
 
@@ -303,18 +302,25 @@ public final class HUDStore {
     public var onExpansionChanged: ((Bool) -> Void)?
     public var onEdgeAnchorChanged: ((EdgeAnchor) -> Void)?
     public var onMenuBarVisibilityChanged: ((Bool) -> Void)?
+    public var onLanguageChanged: ((L10n) -> Void)?
     public var onWatchedPathsChanged: (([String]) -> Void)?
     public var onAttentionAlert: ((AgentSessionState) -> Void)?
     public var onJumpToTerminal: ((AgentKind?, String?) -> Void)?
+    public var onModalPresentationChanged: ((Bool) -> Void)?
 
     // MARK: Internal State
 
-    private var provider: HUDDataProvider
+    private let provider: HUDDataProvider
     private var toastDismissTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
+    private var projectDetailTask: Task<Void, Never>?
+    private var historyTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
     private var sessionRegistry: SessionRegistry = SessionRegistry()
     private var alertedSessionTimestamps: [String: Date] = [:]
+    private var historyLoadedForProject: String?
+    private var historyDirty: Bool = true
+    private var lastLoadedDocTaskDir: String?
 
     private static let showMenuBarIconDefaultsKey = "trellisHUD.showMenuBarIcon"
     private static let maxActivityHistory = 60
@@ -331,12 +337,7 @@ public final class HUDStore {
         } else {
             self.showMenuBarIcon = true
         }
-        self.hookStatuses = provider.getHookStatuses()
-    }
-
-    public func updateProvider(_ newProvider: HUDDataProvider) {
-        self.provider = newProvider
-        self.hookStatuses = newProvider.getHookStatuses()
+        // Hook statuses are loaded asynchronously on launch / Settings open to keep init non-blocking.
     }
 
     // MARK: Derived Properties for UI
@@ -397,21 +398,14 @@ public final class HUDStore {
     }
 
     public var ambientPhaseLabel: String {
+        let loc = l10n
         if let alert = attentionSessions.first {
-            return alert.status.label
+            return loc.statusLabel(alert.status)
         }
         guard let task = selectedTask else {
-            return activeAgentCount > 0 ? "Working" : "Idle"
+            return activeAgentCount > 0 ? loc.statusLabel(.working) : loc.statusLabel(.idle)
         }
-        let shortPhase: String = {
-            switch task.phase {
-            case .explore: return "Explore"
-            case .plan: return "Plan"
-            case .implement: return "Impl"
-            case .check: return "Check"
-            case .archive: return "Archive"
-            }
-        }()
+        let shortPhase = loc.shortPhaseLabel(task.phase)
         if task.totalChecklistCount > 0 {
             return "\(shortPhase) \(task.completedChecklistCount)/\(task.totalChecklistCount)"
         }
@@ -426,22 +420,6 @@ public final class HUDStore {
             return project.name
         }
         return "Trellis HUD"
-    }
-
-    public var ambientSubtitle: String {
-        if let top = activeSessions.first {
-            if let activity = top.activity, !activity.isEmpty {
-                return activity
-            }
-            if let tool = top.toolName, !tool.isEmpty {
-                return "\(top.agent.displayName) · \(tool)"
-            }
-            return "\(top.agent.displayName) · \(top.status.label)"
-        }
-        if let task = selectedTask, let warning = task.phaseWarning, !warning.isEmpty {
-            return warning
-        }
-        return selectedProject?.name ?? "No watched project"
     }
 
     /// Activities scoped to the currently selected task/project (falls back to global recent activities).
@@ -473,14 +451,10 @@ public final class HUDStore {
 
     /// Active task directory absolute path on disk.
     public var selectedTaskDirectoryPath: String? {
-        guard let task = selectedTask else { return nil }
-        return URL(fileURLWithPath: task.projectPath)
-            .appendingPathComponent(".trellis/tasks", isDirectory: true)
-            .appendingPathComponent(task.dir, isDirectory: true)
-            .path
+        selectedTask?.taskDirectoryPath
     }
 
-    // MARK: Presentation Controls
+    // MARK: Presentation & Preference Controls
 
     public func expand() {
         guard !isExpanded else { return }
@@ -501,6 +475,9 @@ public final class HUDStore {
 
     public func toggleSettings() {
         isSettingsOpen.toggle()
+        if isSettingsOpen {
+            refreshHookStatuses()
+        }
     }
 
     public func setPresentationMode(_ mode: PresentationMode) {
@@ -508,7 +485,10 @@ public final class HUDStore {
         config.presentationMode = mode
         persistConfig()
         onPresentationModeChanged?(mode)
-        showToast(mode == .notch ? "Switched to Notch HUD" : "Switched to Edge Pill")
+        showToast(l10n.t(
+            mode == .notch ? "Switched to Notch HUD" : "Switched to Edge Pill",
+            mode == .notch ? "已切换至刘海 HUD" : "已切换至吸边胶囊"
+        ))
     }
 
     public func togglePresentationMode() {
@@ -524,6 +504,7 @@ public final class HUDStore {
 
     public func setEdgeVerticalRatio(_ ratio: Double) {
         let clamped = min(max(ratio, 0.08), 0.92)
+        guard abs(config.edgeVerticalRatio - clamped) > 0.002 else { return }
         config.edgeVerticalRatio = clamped
         persistConfig()
     }
@@ -536,49 +517,72 @@ public final class HUDStore {
     }
 
     public func setAutoFollowFocus(_ enabled: Bool) {
+        guard config.autoFollowFocus != enabled else { return }
         config.autoFollowFocus = enabled
         persistConfig()
     }
 
-    // MARK: Selection & Navigation
+    public func setLanguage(_ newLanguage: AppLanguage) {
+        guard config.language != newLanguage else { return }
+        config.language = newLanguage
+        persistConfig()
+        onLanguageChanged?(l10n)
+    }
+
+    // MARK: Selection & Cross-Tab Navigation
 
     public func selectProject(_ path: String?) {
+        guard selectedProjectPath != path else { return }
         selectedProjectPath = path
         config.selectedProjectPath = path
         persistConfig()
         selectedTaskId = nil
         selectedDocPath = nil
         selectedDocContent = ""
+        lastLoadedDocTaskDir = nil
         selectedSpecPath = nil
+        historyDirty = true
+        historyLoadedForProject = nil
         refreshSelectedProjectDetails()
     }
 
     public func selectTask(_ id: String?) {
+        guard selectedTaskId != id else { return }
         selectedTaskId = id
         selectedDocPath = nil
         selectedDocContent = ""
+        lastLoadedDocTaskDir = nil
         if let firstDoc = selectedTask?.artifacts.documentPaths.first {
             loadDocument(firstDoc)
         }
     }
 
     public func selectChannel(_ id: String?) {
+        guard selectedChannelId != id else { return }
         selectedChannelId = id
     }
 
     public func selectSpec(_ relativePath: String?) {
+        guard selectedSpecPath != relativePath else { return }
         selectedSpecPath = relativePath
     }
 
-    // MARK: Refresh Pipeline
+    public func openSpecInDocsTab(_ specPath: String) {
+        selectedSpecPath = specPath
+        docsSubMode = .projectSpecs
+        selectedTab = .docsSpecs
+    }
+
+    // MARK: Refresh Pipeline (Equality-Guarded, Zero Double-Scan, Lazy History)
 
     public func refreshAll() {
         refreshTask?.cancel()
-        isRefreshing = true
+        if !isRefreshing { isRefreshing = true }
         let currentProvider = provider
         let roots = config.roots
         let dynamicProjects = config.dynamicProjects
         let preferredProjectPath = selectedProjectPath
+        let shouldLoadHistory = (selectedTab == .history)
         let query = historyQuery
 
         refreshTask = Task { [weak self] in
@@ -587,11 +591,17 @@ public final class HUDStore {
             }.value
             guard !Task.isCancelled, let self else { return }
 
-            self.projects = discovered
+            if self.projects != discovered {
+                self.projects = discovered
+            }
+            let nextProjectPath: String?
             if let preferred = preferredProjectPath, discovered.contains(where: { $0.path == preferred }) {
-                self.selectedProjectPath = preferred
+                nextProjectPath = preferred
             } else {
-                self.selectedProjectPath = discovered.first?.path
+                nextProjectPath = discovered.first?.path
+            }
+            if self.selectedProjectPath != nextProjectPath {
+                self.selectedProjectPath = nextProjectPath
             }
 
             let watchedPaths = discovered.map { "\($0.path)/.trellis" }
@@ -600,22 +610,30 @@ public final class HUDStore {
             let targetProject = self.selectedProjectPath
             let result = await Task.detached(priority: .userInitiated) {
                 let active = targetProject.map { currentProvider.scanActiveTasks($0) } ?? []
-                let archived = targetProject.map { currentProvider.scanArchivedTasks($0) } ?? []
-                let specsAndGit = targetProject.map { currentProvider.scanSpecsAndGit($0) } ?? ([], nil)
+                let specRefs = active.flatMap(\.artifacts.specRefs)
+                let specsAndGit = targetProject.map { currentProvider.scanSpecsAndGit($0, specRefs) } ?? ([], nil)
                 let channels = currentProvider.scanChannels()
-                let journals = targetProject.map { currentProvider.scanJournals($0) } ?? []
-                let memory = currentProvider.searchMemory(query, targetProject)
-                return (active, archived, specsAndGit.0, specsAndGit.1, channels, journals, memory)
+                let archived = shouldLoadHistory ? (targetProject.map { currentProvider.scanArchivedTasks($0) } ?? []) : nil
+                let journals = shouldLoadHistory ? (targetProject.map { currentProvider.scanJournals($0) } ?? []) : nil
+                let memory = shouldLoadHistory ? currentProvider.searchMemory(query, targetProject) : nil
+                return (active, specsAndGit.0, specsAndGit.1, channels, archived, journals, memory)
             }.value
             guard !Task.isCancelled else { return }
 
-            self.activeTasks = result.0
-            self.archivedTasks = result.1
-            self.specs = result.2
-            self.gitStatus = result.3
-            self.channels = result.4
-            self.journals = result.5
-            self.memorySessions = result.6
+            if self.activeTasks != result.0 { self.activeTasks = result.0 }
+            if self.specs != result.1 { self.specs = result.1 }
+            if self.gitStatus != result.2 { self.gitStatus = result.2 }
+            if self.channels != result.3 { self.channels = result.3 }
+
+            if let archived = result.4, let journals = result.5, let memory = result.6 {
+                if self.archivedTasks != archived { self.archivedTasks = archived }
+                if self.journals != journals { self.journals = journals }
+                if self.memorySessions != memory { self.memorySessions = memory }
+                self.historyLoadedForProject = targetProject
+                self.historyDirty = false
+            } else {
+                self.historyDirty = true
+            }
 
             if self.selectedTaskId == nil || !self.activeTasks.contains(where: { $0.id == self.selectedTaskId }) {
                 self.selectedTaskId = self.activeTasks.first?.id
@@ -628,43 +646,84 @@ public final class HUDStore {
             }
 
             if let docPath = self.selectedDocPath ?? self.selectedTask?.artifacts.documentPaths.first {
-                self.loadDocument(docPath)
+                self.loadDocument(docPath, silentIfSamePath: true)
             } else {
-                self.selectedDocPath = nil
-                self.selectedDocContent = ""
+                if self.selectedDocPath != nil { self.selectedDocPath = nil }
+                if !self.selectedDocContent.isEmpty { self.selectedDocContent = "" }
+                self.lastLoadedDocTaskDir = nil
             }
 
-            self.isRefreshing = false
+            if self.isRefreshing { self.isRefreshing = false }
         }
     }
 
     public func refreshSelectedProjectDetails() {
+        projectDetailTask?.cancel()
         let currentProvider = provider
         let targetProject = selectedProjectPath
+        let shouldLoadHistory = (selectedTab == .history)
         let query = historyQuery
 
-        Task { [weak self] in
+        projectDetailTask = Task { [weak self] in
             let result = await Task.detached(priority: .userInitiated) {
                 let active = targetProject.map { currentProvider.scanActiveTasks($0) } ?? []
-                let archived = targetProject.map { currentProvider.scanArchivedTasks($0) } ?? []
-                let specsAndGit = targetProject.map { currentProvider.scanSpecsAndGit($0) } ?? ([], nil)
-                let journals = targetProject.map { currentProvider.scanJournals($0) } ?? []
-                let memory = currentProvider.searchMemory(query, targetProject)
-                return (active, archived, specsAndGit.0, specsAndGit.1, journals, memory)
+                let specRefs = active.flatMap(\.artifacts.specRefs)
+                let specsAndGit = targetProject.map { currentProvider.scanSpecsAndGit($0, specRefs) } ?? ([], nil)
+                let archived = shouldLoadHistory ? (targetProject.map { currentProvider.scanArchivedTasks($0) } ?? []) : nil
+                let journals = shouldLoadHistory ? (targetProject.map { currentProvider.scanJournals($0) } ?? []) : nil
+                let memory = shouldLoadHistory ? currentProvider.searchMemory(query, targetProject) : nil
+                return (active, specsAndGit.0, specsAndGit.1, archived, journals, memory)
             }.value
-            guard let self else { return }
+            guard !Task.isCancelled, let self else { return }
 
-            self.activeTasks = result.0
-            self.archivedTasks = result.1
-            self.specs = result.2
-            self.gitStatus = result.3
-            self.journals = result.4
-            self.memorySessions = result.5
+            if self.activeTasks != result.0 { self.activeTasks = result.0 }
+            if self.specs != result.1 { self.specs = result.1 }
+            if self.gitStatus != result.2 { self.gitStatus = result.2 }
+            if let archived = result.3, let journals = result.4, let memory = result.5 {
+                if self.archivedTasks != archived { self.archivedTasks = archived }
+                if self.journals != journals { self.journals = journals }
+                if self.memorySessions != memory { self.memorySessions = memory }
+                self.historyLoadedForProject = targetProject
+                self.historyDirty = false
+            } else {
+                self.historyDirty = true
+            }
+
             self.selectedTaskId = self.activeTasks.first?.id
             self.selectedSpecPath = self.specs.first?.relativePath
             if let doc = self.selectedTask?.artifacts.documentPaths.first {
                 self.loadDocument(doc)
             }
+        }
+    }
+
+    public func refreshHistoryIfNeeded() {
+        guard historyDirty || historyLoadedForProject != selectedProjectPath else { return }
+        refreshHistory()
+    }
+
+    public func refreshHistory() {
+        historyTask?.cancel()
+        isLoadingHistory = true
+        let currentProvider = provider
+        let targetProject = selectedProjectPath
+        let query = historyQuery
+
+        historyTask = Task { [weak self] in
+            let result = await Task.detached(priority: .userInitiated) {
+                let archived = targetProject.map { currentProvider.scanArchivedTasks($0) } ?? []
+                let journals = targetProject.map { currentProvider.scanJournals($0) } ?? []
+                let memory = currentProvider.searchMemory(query, targetProject)
+                return (archived, journals, memory)
+            }.value
+            guard !Task.isCancelled, let self else { return }
+
+            if self.archivedTasks != result.0 { self.archivedTasks = result.0 }
+            if self.journals != result.1 { self.journals = result.1 }
+            if self.memorySessions != result.2 { self.memorySessions = result.2 }
+            self.historyLoadedForProject = targetProject
+            self.historyDirty = false
+            self.isLoadingHistory = false
         }
     }
 
@@ -675,7 +734,9 @@ public final class HUDStore {
                 currentProvider.scanChannels()
             }.value
             guard let self else { return }
-            self.channels = latest
+            if self.channels != latest {
+                self.channels = latest
+            }
             if self.selectedChannelId == nil || !latest.contains(where: { $0.id == self.selectedChannelId }) {
                 self.selectedChannelId = latest.first?.id
             }
@@ -684,32 +745,61 @@ public final class HUDStore {
 
     // MARK: Documents & History Search
 
-    public func loadDocument(_ relativePath: String) {
-        selectedDocPath = relativePath
+    public func loadDocument(_ relativePath: String, silentIfSamePath: Bool = false) {
+        let sameDoc = (selectedDocPath == relativePath && lastLoadedDocTaskDir == selectedTaskDirectoryPath)
+        if selectedDocPath != relativePath {
+            selectedDocPath = relativePath
+        }
         guard let taskDir = selectedTaskDirectoryPath else {
-            selectedDocContent = ""
+            if !selectedDocContent.isEmpty { selectedDocContent = "" }
+            lastLoadedDocTaskDir = nil
             return
         }
-        isLoadingDoc = true
+        if !silentIfSamePath || !sameDoc {
+            isLoadingDoc = true
+        }
         let currentProvider = provider
         Task { [weak self] in
             let content = await Task.detached(priority: .userInitiated) {
                 currentProvider.loadDocument(taskDir, relativePath)
             }.value
-            guard let self, self.selectedDocPath == relativePath else { return }
-            self.selectedDocContent = content ?? ""
-            self.isLoadingDoc = false
+            guard let self, self.selectedDocPath == relativePath, self.selectedTaskDirectoryPath == taskDir else {
+                return
+            }
+            let text = content ?? ""
+            if self.selectedDocContent != text {
+                self.selectedDocContent = text
+            }
+            self.lastLoadedDocTaskDir = taskDir
+            if self.isLoadingDoc {
+                self.isLoadingDoc = false
+            }
         }
+    }
+
+    /// Loads any markdown document (`prd.md`, `design.md`, `implement.md`, `research/*.md`) for either an active or archived task.
+    public func loadDocument(for task: TaskSnapshot, relativePath: String) async -> String {
+        let currentProvider = provider
+        let taskDir = task.taskDirectoryPath
+        let content = await Task.detached(priority: .userInitiated) {
+            currentProvider.loadDocument(taskDir, relativePath)
+        }.value
+        return content ?? ""
     }
 
     public func reloadCurrentDocument() {
         guard let docPath = selectedDocPath else { return }
-        loadDocument(docPath)
+        loadDocument(docPath, silentIfSamePath: false)
     }
 
     public func openDocumentInEditor(_ relativePath: String) {
         guard let taskDir = selectedTaskDirectoryPath else { return }
         let fullPath = URL(fileURLWithPath: taskDir).appendingPathComponent(relativePath).path
+        openInEditor(path: fullPath)
+    }
+
+    public func openDocumentInEditor(for task: TaskSnapshot, relativePath: String) {
+        let fullPath = URL(fileURLWithPath: task.taskDirectoryPath).appendingPathComponent(relativePath).path
         openInEditor(path: fullPath)
     }
 
@@ -720,8 +810,13 @@ public final class HUDStore {
     public func openInEditor(path: String) {
         let url = URL(fileURLWithPath: path)
         if !NSWorkspace.shared.open(url) {
-            showToast("Could not open \(url.lastPathComponent)", isError: true)
+            showToast(l10n.t("Could not open \(url.lastPathComponent)", "无法打开 \(url.lastPathComponent)"), isError: true)
         }
+    }
+
+    public func revealInFinder(path: String) {
+        let url = URL(fileURLWithPath: path)
+        NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
     public func searchHistory(_ query: String) {
@@ -736,7 +831,9 @@ public final class HUDStore {
                 currentProvider.searchMemory(query, projectPath)
             }.value
             guard !Task.isCancelled, let self else { return }
-            self.memorySessions = results
+            if self.memorySessions != results {
+                self.memorySessions = results
+            }
         }
     }
 
@@ -770,7 +867,7 @@ public final class HUDStore {
     private func runAction(_ action: ActionKind) {
         guard runningAction == nil else { return }
         guard let task = selectedTask else {
-            showToast("Select an active task first", isError: true)
+            showToast(l10n.t("Select an active task first", "请先选择一个活跃任务"), isError: true)
             return
         }
         runningAction = action
@@ -785,16 +882,18 @@ public final class HUDStore {
             self.lastActionResult = result
             if result.success {
                 let verb: String = switch action {
-                case .validate: "Validation passed"
-                case .start: "Task started"
-                case .archive: "Task archived"
-                default: "Action succeeded"
+                case .validate: self.l10n.t("Validation passed", "校验通过")
+                case .start: self.l10n.t("Task started", "任务已启动")
+                case .archive: self.l10n.t("Task archived", "任务已归档")
+                default: self.l10n.t("Action succeeded", "操作成功")
                 }
                 self.showToast(result.message.isEmpty ? verb : result.message)
+                self.historyDirty = true
                 self.refreshAll()
             } else {
                 let detail = result.message.isEmpty ? result.stderr : result.message
-                let firstLine = detail.split(whereSeparator: \.isNewline).first.map(String.init) ?? "Action failed"
+                let firstLine = detail.split(whereSeparator: \.isNewline).first.map(String.init)
+                    ?? self.l10n.t("Action failed", "操作失败")
                 self.showToast(firstLine, isError: true)
             }
         }
@@ -803,15 +902,22 @@ public final class HUDStore {
     // MARK: Hook Event Ingestion (from HUDUnixSocketServer / Inbox)
 
     public func ingestHookEvent(_ event: HookEvent) {
-        let normalizedProject = ConfigStore.normalizePath(event.project)
+        let rawProject = event.project
+        let alreadyKnown = projects.contains(where: { $0.path == rawProject })
+            || config.dynamicProjects.contains(rawProject)
+
+        let normalizedProject = alreadyKnown ? rawProject : ConfigStore.normalizePath(rawProject)
         var normalizedEvent = event
         normalizedEvent.project = normalizedProject
 
-        // Register dynamic project if it looks like a valid Trellis project
-        let trellisTasksPath = URL(fileURLWithPath: normalizedProject).appendingPathComponent(".trellis/tasks").path
-        var isDir: ObjCBool = false
-        if FileManager.default.fileExists(atPath: trellisTasksPath, isDirectory: &isDir), isDir.boolValue {
-            if !config.dynamicProjects.contains(normalizedProject) && !projects.contains(where: { $0.path == normalizedProject }) {
+        // Short-circuit in memory before touching FileManager
+        if !alreadyKnown,
+           !projects.contains(where: { $0.path == normalizedProject }),
+           !config.dynamicProjects.contains(normalizedProject),
+           !normalizedProject.isEmpty {
+            let trellisTasksPath = URL(fileURLWithPath: normalizedProject).appendingPathComponent(".trellis/tasks").path
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: trellisTasksPath, isDirectory: &isDir), isDir.boolValue {
                 config.dynamicProjects.append(normalizedProject)
                 persistConfig()
                 refreshAll()
@@ -841,15 +947,21 @@ public final class HUDStore {
                 refreshSelectedProjectDetails()
             }
             if let taskId = normalizedEvent.taskId,
-               let match = activeTasks.first(where: { $0.dir == taskId || $0.record.id == taskId }) {
+               let match = activeTasks.first(where: { $0.dir == taskId || $0.record.id == taskId }),
+               selectedTaskId != match.id {
                 selectedTaskId = match.id
             }
         }
     }
 
-    public func pruneStaleSessions(now: Date = Date()) {
+    @discardableResult
+    public func pruneStaleSessions(now: Date = Date()) -> Bool {
+        let before = sessionRegistry.allSessionsSorted()
         sessionRegistry.prune(now: now)
+        let after = sessionRegistry.allSessionsSorted()
+        guard before != after else { return false }
         rebuildSessionSnapshot()
+        return true
     }
 
     private func rebuildSessionSnapshot() {
@@ -858,48 +970,77 @@ public final class HUDStore {
             registry: sessionRegistry,
             previousFocusKey: selectedTaskId
         )
-        focusSnapshot = snapshot
-        activeSessions = snapshot.activeSessions
-        recentActivities = Array(snapshot.recentActivities.prefix(Self.maxActivityHistory))
+        let nextActivities = Array(snapshot.recentActivities.prefix(Self.maxActivityHistory))
+        if activeSessions != snapshot.activeSessions {
+            activeSessions = snapshot.activeSessions
+        }
+        if recentActivities != nextActivities {
+            recentActivities = nextActivities
+        }
+        if focusSnapshot.focusedTaskKey != snapshot.focusedTaskKey
+            || focusSnapshot.focusedProjectPath != snapshot.focusedProjectPath
+            || focusSnapshot.focusedSessionId != snapshot.focusedSessionId
+            || focusSnapshot.status != snapshot.status
+            || focusSnapshot.attentionCount != snapshot.attentionCount
+            || focusSnapshot.activeSessions != snapshot.activeSessions
+            || focusSnapshot.recentActivities != snapshot.recentActivities {
+            focusSnapshot = snapshot
+        }
     }
 
     // MARK: Watched Roots & Hook Configuration (Settings)
 
     public func addRootFolderInteractive() {
+        onModalPresentationChanged?(true)
+        NSApp.activate(ignoringOtherApps: true)
+
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
-        panel.prompt = "Watch Folder"
-        panel.message = "Select a project or workspace folder containing .trellis projects."
-        if panel.runModal() == .OK, let url = panel.url {
-            addRootFolder(url.path)
+        panel.prompt = l10n.t("Watch Folder", "添加监听目录")
+        panel.message = l10n.t(
+            "Select a project or workspace folder containing .trellis projects.",
+            "选择包含 .trellis 项目的工程或工作区目录。"
+        )
+        panel.begin { [weak self] response in
+            Task { @MainActor in
+                guard let self else { return }
+                self.onModalPresentationChanged?(false)
+                if response == .OK, let url = panel.url {
+                    self.addRootFolder(url.path)
+                }
+            }
         }
     }
 
     public func addRootFolder(_ path: String) {
-        let expanded = (path as NSString).expandingTildeInPath
+        let expanded = ConfigStore.expandHome(path)
         guard !config.roots.contains(expanded) else {
-            showToast("Folder already watched")
+            showToast(l10n.t("Folder already watched", "该目录已在监听列表中"))
             return
         }
         config.roots.append(expanded)
         config.initialized = true
         persistConfig()
-        showToast("Added \(URL(fileURLWithPath: expanded).lastPathComponent)")
+        showToast(l10n.t(
+            "Added \(URL(fileURLWithPath: expanded).lastPathComponent)",
+            "已添加 \(URL(fileURLWithPath: expanded).lastPathComponent)"
+        ))
         refreshAll()
     }
 
     public func removeRootFolder(_ path: String) {
         config.roots.removeAll { $0 == path }
         persistConfig()
-        showToast("Removed watched folder")
+        showToast(l10n.t("Removed watched folder", "已移除监听目录"))
         refreshAll()
     }
 
     public func rediscoverProjects() {
+        historyDirty = true
         refreshAll()
-        showToast("Scanning watched folders…")
+        showToast(l10n.t("Scanning watched folders…", "正在重新扫描目录…"))
     }
 
     public func refreshHookStatuses() {
@@ -909,7 +1050,9 @@ public final class HUDStore {
                 currentProvider.getHookStatuses()
             }.value
             guard let self else { return }
-            self.hookStatuses = latest
+            if self.hookStatuses != latest {
+                self.hookStatuses = latest
+            }
         }
     }
 
@@ -930,7 +1073,10 @@ public final class HUDStore {
                 } else {
                     self.hookStatuses.append(updated)
                 }
-                self.showToast("\(agent.displayName) hook \(enabled ? "installed" : "removed")")
+                self.showToast(self.l10n.t(
+                    "\(agent.displayName) hook \(enabled ? "installed" : "removed")",
+                    "\(agent.displayName) Hook 已\(enabled ? "安装" : "卸载")"
+                ))
             case .failure(let error):
                 self.showToast("\(agent.displayName): \(error.localizedDescription)", isError: true)
             }
@@ -956,56 +1102,16 @@ public final class HUDStore {
         statusToast = nil
     }
 
-    // MARK: Config Persistence Helpers
+    // MARK: Config Persistence
 
     private func persistConfig() {
         do {
             try provider.saveConfig(config)
         } catch {
-            showToast("Failed to save config: \(error.localizedDescription)", isError: true)
+            showToast(l10n.t(
+                "Failed to save config: \(error.localizedDescription)",
+                "保存配置失败：\(error.localizedDescription)"
+            ), isError: true)
         }
-    }
-
-    nonisolated public static func defaultConfigURL() -> URL {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        return home.appendingPathComponent(".config/trellis-card/config.json")
-    }
-
-    nonisolated public static func loadConfigFallback() -> HUDConfig {
-        let url = defaultConfigURL()
-        guard let data = try? Data(contentsOf: url),
-              let decoded = try? JSONDecoder().decode(HUDConfig.self, from: data) else {
-            return HUDConfig()
-        }
-        return decoded
-    }
-
-    nonisolated public static func saveConfigFallback(_ cfg: HUDConfig) throws {
-        let url = defaultConfigURL()
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(cfg)
-        try data.write(to: url, options: .atomic)
-    }
-
-    nonisolated public static func loadDocumentFallback(taskDir: String, relativePath: String) -> String? {
-        let base = URL(fileURLWithPath: taskDir).standardizedFileURL
-        let target = base.appendingPathComponent(relativePath).standardizedFileURL
-        guard target.path.hasPrefix(base.path) else { return nil }
-        return try? String(contentsOf: target, encoding: .utf8)
-    }
-
-    nonisolated public static func defaultHookStatuses() -> [AgentHookStatusInfo] {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return [
-            AgentHookStatusInfo(agent: .claude, installed: false, configExists: false, configPath: "\(home)/.claude/settings.json"),
-            AgentHookStatusInfo(agent: .codex, installed: false, configExists: false, configPath: "\(home)/.codex/hooks.json"),
-            AgentHookStatusInfo(agent: .cursor, installed: false, configExists: false, configPath: "\(home)/.cursor/hooks.json"),
-            AgentHookStatusInfo(agent: .pi, installed: false, configExists: false, configPath: "\(home)/.pi/agent/extensions/trellis-card.ts"),
-            AgentHookStatusInfo(agent: .opencode, installed: false, configExists: false, configPath: "\(home)/.config/opencode/plugins/trellis-card.js"),
-            AgentHookStatusInfo(agent: .dsh, installed: false, configExists: false, configPath: "\(home)/.config/trellis-card/agents/dsh-trellis-bridge"),
-            AgentHookStatusInfo(agent: .antigravity, installed: false, configExists: true, configPath: "\(home)/.gemini/antigravity/brain", isSupported: false, detail: "Observed automatically via trellis mem"),
-        ]
     }
 }

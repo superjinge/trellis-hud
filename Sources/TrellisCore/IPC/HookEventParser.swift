@@ -97,8 +97,11 @@ public enum HookEventParser {
             let parts = token.split(separator: "/").map(String.init)
             guard parts.count >= 3 else { continue }
             for i in 0...(parts.count - 3) {
-                if parts[i] == ".trellis" && parts[i + 1] == "tasks" && !parts[i + 2].isEmpty {
-                    return parts[i + 2]
+                if parts[i] == ".trellis" && parts[i + 1] == "tasks" {
+                    let candidate = parts[i + 2]
+                    if !candidate.isEmpty && candidate != "archive" {
+                        return candidate
+                    }
                 }
             }
         }
@@ -210,16 +213,21 @@ public enum HookEventParser {
     private static func int64Value(_ dict: [String: Any], keys: [String]) -> Int64? {
         for key in keys {
             if let value = dict[key] as? Int64 {
-                return value
+                return normalizeTimestampSeconds(value)
             }
             if let value = dict[key] as? Int {
-                return Int64(value)
+                return normalizeTimestampSeconds(Int64(value))
             }
-            if let value = dict[key] as? Double {
-                return Int64(value)
+            if let value = dict[key] as? Double, value.isFinite,
+               value >= Double(Int64.min), value <= Double(Int64.max) {
+                return normalizeTimestampSeconds(Int64(value))
             }
         }
         return nil
+    }
+
+    private static func normalizeTimestampSeconds(_ raw: Int64) -> Int64 {
+        raw > 1_000_000_000_000 ? raw / 1_000 : raw
     }
 
     private static func workspaceRoot(_ dict: [String: Any]) -> String? {
@@ -300,7 +308,7 @@ public enum HookEventParser {
             }
             let parent = current.deletingLastPathComponent()
             if parent.path == current.path {
-                return path
+                return ConfigStore.normalizePath(path)
             }
             current = parent
         }

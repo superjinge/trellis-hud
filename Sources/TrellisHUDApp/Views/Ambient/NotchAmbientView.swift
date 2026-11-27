@@ -40,8 +40,21 @@ public struct NotchAmbientView: View {
             onTap()
         }
         .onAppear {
+            syncBreathingAnimation()
+        }
+        .onChange(of: isBreathing) { _, _ in
+            syncBreathingAnimation()
+        }
+    }
+
+    private func syncBreathingAnimation() {
+        if isBreathing {
             withAnimation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true)) {
                 pulsePhase = true
+            }
+        } else {
+            withAnimation(.linear(duration: 0.15)) {
+                pulsePhase = false
             }
         }
     }
@@ -84,7 +97,7 @@ public struct NotchAmbientView: View {
                 } else {
                     Text(store.ambientTaskTitle)
                         .font(.system(size: 10.5, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.68))
+                        .foregroundStyle(.white.opacity(0.72))
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }
@@ -116,11 +129,11 @@ public struct NotchAmbientView: View {
 
             Text("·")
                 .font(.system(size: 11, weight: .bold))
-                .foregroundStyle(.white.opacity(0.3))
+                .foregroundStyle(.white.opacity(0.32))
 
             Text(store.ambientTaskTitle)
                 .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(.white.opacity(0.84))
+                .foregroundStyle(.white.opacity(0.86))
                 .lineLimit(1)
                 .truncationMode(.tail)
 
@@ -141,7 +154,7 @@ public struct NotchAmbientView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(
             Capsule()
-                .fill(Color.black.opacity(0.92))
+                .fill(Color.black.opacity(0.94))
         )
         .overlay(
             Capsule()

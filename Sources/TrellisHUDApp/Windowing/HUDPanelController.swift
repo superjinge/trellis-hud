@@ -1,9 +1,10 @@
 import AppKit
+import Observation
 import SwiftUI
 import TrellisCore
 
 /// Borderless, non-activating floating `NSPanel` that never steals focus while collapsed,
-/// and smoothly accepts keyboard focus (e.g., History search & Escape) when expanded.
+/// and smoothly becomes key when expanded so buttons, menus, and text fields respond on the first click.
 public final class HUDPanel: NSPanel {
     public var allowKeyFocus: Bool = false
 
@@ -18,6 +19,7 @@ public final class HUDPanel: NSPanel {
             defer: false
         )
         isFloatingPanel = true
+        becomesKeyOnlyIfNeeded = false
         backgroundColor = .clear
         isOpaque = false
         hasShadow = false
@@ -29,24 +31,115 @@ public final class HUDPanel: NSPanel {
     }
 }
 
+/// Custom `NSHostingView` that:
+/// 1. Accepts first mouse click immediately (`acceptsFirstMouse -> true`) so SwiftUI buttons/tabs never drop click #1.
+/// 2. Keeps its CoreAnimation layer strictly transparent (no rectangular backdrop/shadow artifacts).
+/// 3. Handles collapsed Edge Pill dragging directly in AppKit screen coordinates (`NSEvent.mouseLocation`)
+///    to completely eliminate SwiftUI `DragGesture` coordinate-feedback ghosting.
+public final class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
+    public var isEdgePillDraggable: (() -> Bool)?
+    public var onEdgePillTapped: (() -> Void)?
+    public var onEdgePillDragEnded: (() -> Void)?
+
+    private var dragStartMouse: NSPoint?
+    private var dragStartOrigin: NSPoint?
+    private var didExceedDragThreshold: Bool = false
+
+    public required init(rootView: Content) {
+        super.init(rootView: rootView)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+        layer?.isOpaque = false
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    public override var isOpaque: Bool { false }
+
+    public override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
+    public override func mouseDown(with event: NSEvent) {
+        if event.type == .leftMouseDown, isEdgePillDraggable?() == true, let window {
+            dragStartMouse = NSEvent.mouseLocation
+            dragStartOrigin = window.frame.origin
+            didExceedDragThreshold = false
+            return
+        }
+        super.mouseDown(with: event)
+    }
+
+    public override func mouseDragged(with event: NSEvent) {
+        if let startMouse = dragStartMouse, let startOrigin = dragStartOrigin, let window {
+            let current = NSEvent.mouseLocation
+            let dx = current.x - startMouse.x
+            let dy = current.y - startMouse.y
+            if !didExceedDragThreshold, hypot(dx, dy) >= 4.0 {
+                didExceedDragThreshold = true
+            }
+            if didExceedDragThreshold {
+                window.setFrameOrigin(NSPoint(
+                    x: (startOrigin.x + dx).rounded(),
+                    y: (startOrigin.y + dy).rounded()
+                ))
+            }
+            return
+        }
+        super.mouseDragged(with: event)
+    }
+
+    public override func mouseUp(with event: NSEvent) {
+        if dragStartMouse != nil {
+            let dragged = didExceedDragThreshold
+            dragStartMouse = nil
+            dragStartOrigin = nil
+            didExceedDragThreshold = false
+            if dragged {
+                onEdgePillDragEnded?()
+            } else {
+                onEdgePillTapped?()
+            }
+            return
+        }
+        super.mouseUp(with: event)
+    }
+}
+
+/// Observable holder for screen notch metrics so `HUDPanelController` NEVER tears down `hostingView.rootView`.
+@Observable
+@MainActor
+private final class PanelMetricsState {
+    var metrics: ScreenGeometry.NotchMetrics
+
+    init(metrics: ScreenGeometry.NotchMetrics) {
+        self.metrics = metrics
+    }
+}
+
 /// Hosts the dual-mode HUD window (True Notch HUD ↔ Edge-Docked Floating Pill)
-/// and coordinates smooth collapsed ↔ expanded Workbench transitions.
+/// and coordinates smooth collapsed ↔ expanded Workbench transitions without view-tree teardown.
 @MainActor
 public final class HUDPanelController {
     private let store: HUDStore
     private let panel: HUDPanel
-    private let hostingView: NSHostingView<AnyView>
+    private let metricsState: PanelMetricsState
+    private let hostingView: FirstMouseHostingView<HUDRootContainerView>
 
     private var hoverExpandTask: Task<Void, Never>?
-    private var globalMouseMonitor: Any?
-    private var localKeyMonitor: Any?
-    private var screenObserver: NSObjectProtocol?
-    private var dragOrigin: NSPoint?
+    nonisolated(unsafe) private var globalMouseMonitor: Any?
+    nonisolated(unsafe) private var localKeyMonitor: Any?
+    nonisolated(unsafe) private var screenObserver: NSObjectProtocol?
+    private var isModalOpen: Bool = false
 
     public init(store: HUDStore) {
         self.store = store
         let screen = ScreenGeometry.activeScreen() ?? NSScreen.screens.first
         let initialFrame: NSRect
+        let initialMetrics: ScreenGeometry.NotchMetrics
         if let screen {
             initialFrame = ScreenGeometry.collapsedFrame(
                 mode: store.presentationMode,
@@ -54,38 +147,100 @@ public final class HUDPanelController {
                 verticalRatio: store.edgeVerticalRatio,
                 on: screen
             )
+            initialMetrics = ScreenGeometry.notchMetrics(for: screen)
         } else {
             initialFrame = NSRect(x: 200, y: 200, width: 248, height: 28)
+            initialMetrics = ScreenGeometry.NotchMetrics(
+                hasHardwareNotch: false,
+                notchWidth: 0,
+                notchHeight: 28,
+                screenFrame: initialFrame,
+                visibleFrame: initialFrame
+            )
         }
 
         self.panel = HUDPanel(contentRect: initialFrame)
-        self.hostingView = NSHostingView(rootView: AnyView(EmptyView()))
+        self.metricsState = PanelMetricsState(metrics: initialMetrics)
+
+        let placeholder = HUDRootContainerView(
+            store: store,
+            metricsState: metricsState,
+            onNotchHoverChanged: { _ in },
+            onAmbientTap: {}
+        )
+        self.hostingView = FirstMouseHostingView(rootView: placeholder)
         self.hostingView.frame = NSRect(origin: .zero, size: initialFrame.size)
         self.hostingView.autoresizingMask = [.width, .height]
         self.panel.contentView = self.hostingView
 
+        // Set the permanent root view ONCE with weak-self callbacks; never reassign `rootView` again.
+        self.hostingView.rootView = HUDRootContainerView(
+            store: store,
+            metricsState: metricsState,
+            onNotchHoverChanged: { [weak self] hovering in
+                self?.handleNotchHover(hovering)
+            },
+            onAmbientTap: { [weak self] in
+                self?.store.toggleExpanded()
+            }
+        )
+
+        self.hostingView.isEdgePillDraggable = { [weak self] in
+            guard let self else { return false }
+            return self.store.presentationMode == .edgePill && !self.store.isExpanded
+        }
+        self.hostingView.onEdgePillTapped = { [weak self] in
+            self?.store.toggleExpanded()
+        }
+        self.hostingView.onEdgePillDragEnded = { [weak self] in
+            self?.handlePillDragEnd()
+        }
+
         bindStoreCallbacks()
         observeScreenChanges()
-        refreshRootView()
         panel.orderFrontRegardless()
     }
 
+    deinit {
+        if let screenObserver {
+            NotificationCenter.default.removeObserver(screenObserver)
+        }
+        if let globalMouseMonitor {
+            NSEvent.removeMonitor(globalMouseMonitor)
+        }
+        if let localKeyMonitor {
+            NSEvent.removeMonitor(localKeyMonitor)
+        }
+    }
+
+    public func teardown() {
+        hoverExpandTask?.cancel()
+        hoverExpandTask = nil
+        if let screenObserver {
+            NotificationCenter.default.removeObserver(screenObserver)
+            self.screenObserver = nil
+        }
+        removeInteractionMonitors()
+    }
+
     public func show() {
+        updateMetricsForTargetScreen()
         updatePanelFrame(animated: false)
         panel.orderFrontRegardless()
     }
 
-    public func hide() {
-        hoverExpandTask?.cancel()
-        removeInteractionMonitors()
-        panel.orderOut(nil)
+    /// Lowers the HUD panel level temporarily while a system modal (`NSOpenPanel`) is active
+    /// so the file picker always appears cleanly in front of the HUD.
+    public func setModalSuppressed(_ suppressed: Bool) {
+        isModalOpen = suppressed
+        panel.level = suppressed ? .floating : .statusBar
     }
 
     private func bindStoreCallbacks() {
         store.onPresentationModeChanged = { [weak self] _ in
             guard let self else { return }
             self.hoverExpandTask?.cancel()
-            self.refreshRootView()
+            self.updateMetricsForTargetScreen()
             self.updatePanelFrame(animated: true)
         }
 
@@ -93,18 +248,23 @@ public final class HUDPanelController {
             guard let self else { return }
             self.hoverExpandTask?.cancel()
             self.panel.allowKeyFocus = expanded
-            self.refreshRootView()
+            self.updateMetricsForTargetScreen()
             self.updatePanelFrame(animated: true)
             if expanded {
                 self.installInteractionMonitors()
-                self.panel.orderFrontRegardless()
+                self.panel.makeKeyAndOrderFront(nil)
             } else {
                 self.removeInteractionMonitors()
+                self.panel.orderFrontRegardless()
             }
         }
 
         store.onEdgeAnchorChanged = { [weak self] _ in
             self?.updatePanelFrame(animated: true)
+        }
+
+        store.onModalPresentationChanged = { [weak self] active in
+            self?.setModalSuppressed(active)
         }
     }
 
@@ -115,51 +275,29 @@ public final class HUDPanelController {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                self?.refreshRootView()
+                self?.updateMetricsForTargetScreen()
                 self?.updatePanelFrame(animated: false)
             }
         }
     }
 
-    private func refreshRootView() {
-        let screen = currentTargetScreen()
-        let metrics = screen.map { ScreenGeometry.notchMetrics(for: $0) }
-            ?? ScreenGeometry.NotchMetrics(
-                hasHardwareNotch: false,
-                notchWidth: 0,
-                notchHeight: 28,
-                screenFrame: panel.frame,
-                visibleFrame: panel.frame
-            )
-
-        let root = HUDRootContainerView(
-            store: store,
-            metrics: metrics,
-            onNotchHoverChanged: { [weak self] hovering in
-                self?.handleNotchHover(hovering)
-            },
-            onAmbientTap: { [weak self] in
-                self?.store.toggleExpanded()
-            },
-            onPillDragDelta: { [weak self] delta in
-                self?.handlePillDragDelta(delta)
-            },
-            onPillDragEnd: { [weak self] in
-                self?.handlePillDragEnd()
-            }
-        )
-        hostingView.rootView = AnyView(root)
+    private func currentTargetScreen() -> NSScreen? {
+        if store.presentationMode == .notch {
+            return ScreenGeometry.activeScreen() ?? panel.screen ?? NSScreen.screens.first
+        }
+        return panel.screen ?? ScreenGeometry.activeScreen() ?? NSScreen.screens.first
     }
 
-    private func currentTargetScreen() -> NSScreen? {
-        if let panelScreen = panel.screen {
-            return panelScreen
+    private func updateMetricsForTargetScreen() {
+        guard let screen = currentTargetScreen() else { return }
+        let next = ScreenGeometry.notchMetrics(for: screen)
+        if metricsState.metrics != next {
+            metricsState.metrics = next
         }
-        return ScreenGeometry.activeScreen()
     }
 
     private func updatePanelFrame(animated: Bool) {
-        guard let screen = currentTargetScreen() ?? NSScreen.screens.first else { return }
+        guard let screen = currentTargetScreen() else { return }
         let target: NSRect
         if store.isExpanded {
             target = ScreenGeometry.expandedFrame(
@@ -179,7 +317,7 @@ public final class HUDPanelController {
 
         if animated {
             NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.22
+                ctx.duration = 0.20
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
                 panel.animator().setFrame(target, display: true)
             }
@@ -191,7 +329,9 @@ public final class HUDPanelController {
     // MARK: Notch Hover (150ms anti-jitter delay)
 
     private func handleNotchHover(_ hovering: Bool) {
-        store.isHovered = hovering
+        if store.isHovered != hovering {
+            store.isHovered = hovering
+        }
         hoverExpandTask?.cancel()
         guard store.presentationMode == .notch, hovering, !store.isExpanded else { return }
         hoverExpandTask = Task { [weak self] in
@@ -201,24 +341,9 @@ public final class HUDPanelController {
         }
     }
 
-    // MARK: Edge Pill Drag & Magnetic Edge Snap
-
-    private func handlePillDragDelta(_ delta: CGSize) {
-        guard store.presentationMode == .edgePill, !store.isExpanded else { return }
-        if dragOrigin == nil {
-            dragOrigin = panel.frame.origin
-        }
-        guard let origin = dragOrigin else { return }
-        // SwiftUI global DragGesture translation uses top-left Y+, AppKit screen coordinates use bottom-left Y+
-        let newOrigin = NSPoint(
-            x: origin.x + delta.width,
-            y: origin.y - delta.height
-        )
-        panel.setFrameOrigin(newOrigin)
-    }
+    // MARK: Edge Pill Magnetic Snap (AppKit screen-space drag completes here)
 
     private func handlePillDragEnd() {
-        dragOrigin = nil
         guard store.presentationMode == .edgePill, !store.isExpanded else { return }
         let screen = panel.screen ?? ScreenGeometry.activeScreen() ?? NSScreen.screens.first
         guard let screen else { return }
@@ -233,6 +358,19 @@ public final class HUDPanelController {
 
     // MARK: Click-Outside & Escape Collapse Monitors
 
+    private func isClickInsideOwnWindows(_ clickPoint: NSPoint) -> Bool {
+        if panel.frame.contains(clickPoint) {
+            return true
+        }
+        // Ignore clicks landing inside SwiftUI popovers, NSMenu popups, or attached sheets belonging to this app
+        for window in NSApp.windows where window.isVisible && window !== panel {
+            if window.frame.contains(clickPoint) {
+                return true
+            }
+        }
+        return false
+    }
+
     private func installInteractionMonitors() {
         removeInteractionMonitors()
 
@@ -240,9 +378,11 @@ public final class HUDPanelController {
             matching: [.leftMouseDown, .rightMouseDown]
         ) { [weak self] _ in
             Task { @MainActor in
-                guard let self, self.store.isExpanded, !self.store.isSettingsOpen else { return }
+                guard let self, self.store.isExpanded, !self.store.isSettingsOpen, !self.isModalOpen else {
+                    return
+                }
                 let clickPoint = NSEvent.mouseLocation
-                if !self.panel.frame.contains(clickPoint) {
+                if !self.isClickInsideOwnWindows(clickPoint) {
                     self.store.collapse()
                 }
             }
@@ -276,43 +416,31 @@ public final class HUDPanelController {
     }
 }
 
-/// Switches smoothly between collapsed ambient surface (Notch or Edge Pill) and expanded `WorkbenchContainerView`.
+/// Permanent root SwiftUI container hosted inside `FirstMouseHostingView` (never torn down on expand/collapse).
 private struct HUDRootContainerView: View {
     let store: HUDStore
-    let metrics: ScreenGeometry.NotchMetrics
+    let metricsState: PanelMetricsState
     let onNotchHoverChanged: (Bool) -> Void
     let onAmbientTap: () -> Void
-    let onPillDragDelta: (CGSize) -> Void
-    let onPillDragEnd: () -> Void
 
     var body: some View {
         ZStack {
             if store.isExpanded {
                 WorkbenchContainerView(store: store)
-                    .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
             } else {
                 switch store.presentationMode {
                 case .notch:
                     NotchAmbientView(
                         store: store,
-                        metrics: metrics,
+                        metrics: metricsState.metrics,
                         onHoverChanged: onNotchHoverChanged,
                         onTap: onAmbientTap
                     )
-                    .transition(.opacity)
                 case .edgePill:
-                    EdgePillAmbientView(
-                        store: store,
-                        onTap: onAmbientTap,
-                        onDragDelta: onPillDragDelta,
-                        onDragEnd: onPillDragEnd
-                    )
-                    .transition(.opacity)
+                    EdgePillAmbientView(store: store)
                 }
             }
         }
-        .animation(.spring(response: 0.24, dampingFraction: 0.86), value: store.isExpanded)
-        .animation(.easeInOut(duration: 0.18), value: store.presentationMode)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }

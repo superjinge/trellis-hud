@@ -1,4 +1,111 @@
 import Foundation
+import os
+
+/// Thread-safe, allocation-light ISO8601 date parser shared by `ChannelReader` and `MemoryReader`.
+internal enum ISO8601FastParser: Sendable {
+    private final class Formatters: @unchecked Sendable {
+        let withFractional: ISO8601DateFormatter
+        let standard: ISO8601DateFormatter
+
+        init() {
+            let f1 = ISO8601DateFormatter()
+            f1.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            self.withFractional = f1
+
+            let f2 = ISO8601DateFormatter()
+            f2.formatOptions = [.withInternetDateTime]
+            self.standard = f2
+        }
+    }
+
+    private static let lock = OSAllocatedUnfairLock(initialState: Formatters())
+
+    /// Fast lock-free parser for standard RFC3339 timestamps (`YYYY-MM-DDTHH:MM:SS[.fff](Z|±HH:MM)`),
+    /// with a thread-safe cached `ISO8601DateFormatter` fallback for non-standard variants.
+    static func parse(_ value: String) -> Date? {
+        if let fast = parseRFC3339Fast(value) {
+            return fast
+        }
+        return lock.withLock { formatters in
+            if let d = formatters.withFractional.date(from: value) {
+                return d
+            }
+            return formatters.standard.date(from: value)
+        }
+    }
+
+    private static func parseRFC3339Fast(_ value: String) -> Date? {
+        let bytes = Array(value.utf8)
+        guard bytes.count >= 20 else { return nil }
+        guard bytes[4] == 45, bytes[7] == 45, (bytes[10] == 84 || bytes[10] == 116 || bytes[10] == 32),
+              bytes[13] == 58, bytes[16] == 58
+        else { return nil }
+
+        guard let year = parseDigits(bytes, 0, 4),
+              let month = parseDigits(bytes, 5, 2),
+              let day = parseDigits(bytes, 8, 2),
+              let hour = parseDigits(bytes, 11, 2),
+              let minute = parseDigits(bytes, 14, 2),
+              let second = parseDigits(bytes, 17, 2)
+        else { return nil }
+
+        var idx = 19
+        var fractionalSeconds = 0.0
+        if idx < bytes.count && bytes[idx] == 46 { // '.'
+            idx += 1
+            var scale = 0.1
+            var digits = 0
+            while idx < bytes.count, bytes[idx] >= 48 && bytes[idx] <= 57 {
+                if digits < 9 {
+                    fractionalSeconds += Double(bytes[idx] - 48) * scale
+                    scale *= 0.1
+                }
+                digits += 1
+                idx += 1
+            }
+            if digits == 0 { return nil }
+        }
+
+        guard idx < bytes.count else { return nil }
+        var tzOffsetSeconds = 0
+        let tzMarker = bytes[idx]
+        if tzMarker == 90 || tzMarker == 122 { // 'Z' or 'z'
+            guard idx + 1 == bytes.count else { return nil }
+        } else if tzMarker == 43 || tzMarker == 45 { // '+' or '-'
+            let sign = tzMarker == 43 ? 1 : -1
+            idx += 1
+            guard idx + 5 == bytes.count, bytes[idx + 2] == 58,
+                  let tzHour = parseDigits(bytes, idx, 2),
+                  let tzMin = parseDigits(bytes, idx + 3, 2)
+            else { return nil }
+            tzOffsetSeconds = sign * (tzHour * 3600 + tzMin * 60)
+        } else {
+            return nil
+        }
+
+        var tmVal = tm()
+        tmVal.tm_year = Int32(year - 1900)
+        tmVal.tm_mon = Int32(month - 1)
+        tmVal.tm_mday = Int32(day)
+        tmVal.tm_hour = Int32(hour)
+        tmVal.tm_min = Int32(minute)
+        tmVal.tm_sec = Int32(second)
+
+        let epoch = timegm(&tmVal)
+        guard epoch != -1 || (year == 1969 && month == 12 && day == 31) else { return nil }
+        return Date(timeIntervalSince1970: Double(epoch - tzOffsetSeconds) + fractionalSeconds)
+    }
+
+    private static func parseDigits(_ bytes: [UInt8], _ offset: Int, _ count: Int) -> Int? {
+        var acc = 0
+        for i in offset..<(offset + count) {
+            let b = bytes[i]
+            guard b >= 48 && b <= 57 else { return nil }
+            acc = acc * 10 + Int(b - 48)
+        }
+        return acc
+    }
+}
 
 /// Reads and reduces Trellis multi-agent channel event logs (`~/.trellis/channels/<project>/<channel>/events.jsonl`)
 /// into `ChannelInfo`, `ChannelWorkerState`, `ChannelThread`, and `ChannelMessage`.
@@ -6,6 +113,10 @@ import Foundation
 /// Mirrors the exact reduction semantics of `Trellis/packages/core/src/channel/internal/store/`.
 public enum ChannelReader: Sendable {
     public static let globalProjectKey = "_global"
+    /// Maximum tail slice read from `events.jsonl` to keep memory bounded on long-lived channels.
+    private static let maxTailBytes: UInt64 = 2 * 1024 * 1024
+    /// Head slice preserved when tailing huge logs so the `seq: 1` `create` metadata event is retained.
+    private static let headMetadataBytes = 8 * 1024
 
     /// Resolves the root directory for Trellis channel stores (`$TRELLIS_CHANNEL_ROOT` or `~/.trellis/channels`).
     public static func defaultChannelRoot(homeDirectory: String? = nil) -> String {
@@ -72,7 +183,7 @@ public enum ChannelReader: Sendable {
                 let dirPath = (bucketDir as NSString).appendingPathComponent(channelName)
                 let eventsFile = (dirPath as NSString).appendingPathComponent("events.jsonl")
                 guard fm.fileExists(atPath: eventsFile),
-                      let content = try? String(contentsOfFile: eventsFile, encoding: .utf8)
+                      let content = readBoundedEventsLog(path: eventsFile)
                 else { continue }
 
                 let (info, isEphemeral) = parseChannelEventsWithEphemeralFlag(
@@ -116,6 +227,45 @@ public enum ChannelReader: Sendable {
             dirPath: dirPath,
             maxRecentMessages: maxRecentMessages
         ).info
+    }
+
+    // MARK: - Bounded File Reading
+
+    private static func readBoundedEventsLog(path: String) -> String? {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let fileSize = (attrs[.size] as? NSNumber)?.uint64Value
+        else {
+            return try? String(contentsOfFile: path, encoding: .utf8)
+        }
+
+        if fileSize <= maxTailBytes {
+            return try? String(contentsOfFile: path, encoding: .utf8)
+        }
+
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+
+        // Preserve first line (`create` event) for channel metadata before reading the bounded tail.
+        let headData = (try? handle.read(upToCount: headMetadataBytes)) ?? Data()
+        let headText = String(decoding: headData, as: UTF8.self)
+        let firstLine = headText.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: true)
+            .first.map(String.init) ?? ""
+
+        let tailOffset = fileSize - maxTailBytes
+        do {
+            try handle.seek(toOffset: tailOffset)
+        } catch {
+            return firstLine.isEmpty ? nil : firstLine
+        }
+
+        let tailData = (try? handle.readToEnd()) ?? Data()
+        var tailText = String(decoding: tailData, as: UTF8.self)
+        // Drop potentially torn partial line at the seek boundary.
+        if let firstNewline = tailText.firstIndex(of: "\n") {
+            tailText = String(tailText[tailText.index(after: firstNewline)...])
+        }
+
+        return firstLine.isEmpty ? tailText : (firstLine + "\n" + tailText)
     }
 
     // MARK: - Event Reduction
@@ -170,7 +320,7 @@ public enum ChannelReader: Sendable {
 
             let seq = intValue(obj["seq"]) ?? (events.count + 1)
             let tsString = obj["ts"] as? String
-            let tsDate = tsString.flatMap(parseISO8601Date)
+            let tsDate = tsString.flatMap(ISO8601FastParser.parse)
             let by = (obj["by"] as? String) ?? "unknown"
             let to = parseToTargets(obj["to"])
             let origin = obj["origin"] as? String
@@ -251,7 +401,7 @@ public enum ChannelReader: Sendable {
         // 2. Reduce threads (with rename alias flattening)
         let threads = reduceThreads(events: events)
 
-        // 3. Reduce workers + pending inbox counts
+        // 3. Reduce workers + O(events) pending inbox counts
         let workers = reduceWorkers(events: events, channelName: name)
 
         // 4. Collect recent human-visible messages
@@ -499,24 +649,71 @@ public enum ChannelReader: Sendable {
             accMap[ident.id] = acc
         }
 
-        // Second pass: durable pending message count matching inboxPolicy.
-        var workers: [ChannelWorkerState] = []
-        for (_, var acc) in accMap {
-            if acc.state.isTerminal {
-                acc.state.pendingMessageCount = 0
+        // Single linear pass over events for pendingMessageCount (O(events + workers log events)).
+        var workers = Array(accMap.values)
+        var activeIndexById: [String: Int] = [:]
+        var broadcastWorkerIndices: [Int] = []
+        for idx in workers.indices {
+            if workers[idx].state.isTerminal {
+                workers[idx].state.pendingMessageCount = 0
             } else {
-                var pending = 0
-                for ev in events where ev.seq > acc.consumedInputSeq {
-                    if matchesInboxPolicy(ev: ev, workerId: acc.state.workerId, policy: acc.state.inboxPolicy) {
-                        pending += 1
-                    }
+                activeIndexById[workers[idx].state.workerId] = idx
+                if workers[idx].state.inboxPolicy == .broadcastAndExplicit {
+                    broadcastWorkerIndices.append(idx)
                 }
-                acc.state.pendingMessageCount = pending
             }
-            workers.append(acc.state)
         }
 
-        return workers.sorted { $0.workerId < $1.workerId }
+        if !activeIndexById.isEmpty {
+            var allBroadcastSeqs: [Int] = []
+            var broadcastSeqsBySender: [String: [Int]] = [:]
+
+            for ev in events where ev.kind == "message" {
+                if !ev.to.isEmpty {
+                    var countedTargets = Set<String>()
+                    for target in ev.to where target != ev.by && countedTargets.insert(target).inserted {
+                        if let idx = activeIndexById[target], ev.seq > workers[idx].consumedInputSeq {
+                            workers[idx].state.pendingMessageCount += 1
+                        }
+                    }
+                } else if !broadcastWorkerIndices.isEmpty {
+                    allBroadcastSeqs.append(ev.seq)
+                    if activeIndexById[ev.by] != nil {
+                        broadcastSeqsBySender[ev.by, default: []].append(ev.seq)
+                    }
+                }
+            }
+
+            if !allBroadcastSeqs.isEmpty {
+                allBroadcastSeqs.sort()
+                for key in broadcastSeqsBySender.keys {
+                    broadcastSeqsBySender[key]?.sort()
+                }
+                for idx in broadcastWorkerIndices {
+                    let threshold = workers[idx].consumedInputSeq
+                    let totalAfter = countGreater(inSorted: allBroadcastSeqs, than: threshold)
+                    let selfAfter = broadcastSeqsBySender[workers[idx].state.workerId]
+                        .map { countGreater(inSorted: $0, than: threshold) } ?? 0
+                    workers[idx].state.pendingMessageCount += max(0, totalAfter - selfAfter)
+                }
+            }
+        }
+
+        return workers.map(\.state).sorted { $0.workerId < $1.workerId }
+    }
+
+    private static func countGreater(inSorted array: [Int], than value: Int) -> Int {
+        var lo = 0
+        var hi = array.count
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2
+            if array[mid] <= value {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        return array.count - lo
     }
 
     private static func identifyWorker(_ ev: RawEvent) -> (id: String, canCreate: Bool)? {
@@ -546,18 +743,6 @@ public enum ChannelReader: Sendable {
         default:
             return nil
         }
-    }
-
-    private static func matchesInboxPolicy(
-        ev: RawEvent,
-        workerId: String,
-        policy: ChannelInboxPolicy
-    ) -> Bool {
-        guard ev.kind == "message", ev.by != workerId else { return false }
-        if !ev.to.isEmpty {
-            return ev.to.contains(workerId)
-        }
-        return policy == .broadcastAndExplicit
     }
 
     private static func toChannelMessage(_ ev: RawEvent, channelName: String) -> ChannelMessage? {
@@ -642,15 +827,5 @@ public enum ChannelReader: Sendable {
         if let i = raw as? Int { return i }
         if let n = raw as? NSNumber { return n.intValue }
         return nil
-    }
-
-    private static func parseISO8601Date(_ value: String) -> Date? {
-        let withFrac = ISO8601DateFormatter()
-        withFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = withFrac.date(from: value) { return d }
-
-        let standard = ISO8601DateFormatter()
-        standard.formatOptions = [.withInternetDateTime]
-        return standard.date(from: value)
     }
 }

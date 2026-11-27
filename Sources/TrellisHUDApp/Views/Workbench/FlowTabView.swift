@@ -8,50 +8,67 @@ struct FlowTabView: View {
     @State private var showActionOutput = false
 
     var body: some View {
+        let l10n = store.l10n
+
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     if let task = store.selectedTask {
-                        pipelineCard(task: task)
-                        checklistOrArtifactCard(task: task)
+                        pipelineCard(task: task, l10n: l10n)
+                        checklistOrArtifactCard(task: task, l10n: l10n)
                     } else {
-                        noTaskCard
+                        noTaskCard(l10n: l10n)
                     }
 
-                    gitAndSpecCard
-                    activityTraceCard
+                    gitAndSpecCard(l10n: l10n)
+                    activityTraceCard(l10n: l10n)
                 }
                 .padding(14)
             }
 
-            if let result = store.lastActionResult, showActionOutput {
-                actionOutputDrawer(result)
+            if let running = store.runningAction {
+                runningActionDrawer(running, l10n: l10n)
+            } else if let result = store.lastActionResult, showActionOutput {
+                actionOutputDrawer(result, l10n: l10n)
             }
 
-            Divider().opacity(0.45)
-            humanGateActionBar
+            Divider().opacity(0.55)
+            humanGateActionBar(l10n: l10n)
+        }
+        .onChange(of: store.lastActionResult) { _, newValue in
+            if newValue != nil {
+                showActionOutput = true
+            }
         }
     }
 
     // MARK: - No Task Empty State
 
-    private var noTaskCard: some View {
+    private func noTaskCard(l10n: L10n) -> some View {
         WorkbenchCard {
             EmptyStatePlaceholder(
                 systemImage: "tray",
-                title: store.selectedProject == nil ? "No Watched Project" : "No Active Trellis Task",
+                title: store.selectedProject == nil
+                    ? l10n.t("No Watched Project", "暂无监听项目")
+                    : l10n.t("No Active Trellis Task", "暂无进行中的 Trellis 任务"),
                 subtitle: store.selectedProject == nil
-                    ? "Open Settings to add a folder containing .trellis projects."
-                    : "Start a task in \(store.selectedProject?.name ?? "your repo") with trellis task create, or inspect Git & Specs below."
+                    ? l10n.t(
+                        "Open Settings to add a folder containing .trellis projects.",
+                        "请打开设置添加包含 .trellis 项目的文件夹。"
+                    )
+                    : l10n.t(
+                        "Start a task in \(store.selectedProject?.name ?? "your repo") with trellis task create, or inspect Git & Specs below.",
+                        "在 \(store.selectedProject?.name ?? "当前仓库") 中运行 trellis task create 创建任务，或在下方查看 Git 与规范状态。"
+                    )
             )
         }
     }
 
     // MARK: - 5-Step Real Workflow Pipeline
 
-    private func pipelineCard(task: TaskSnapshot) -> some View {
+    private func pipelineCard(task: TaskSnapshot, l10n: L10n) -> some View {
         WorkbenchCard(
-            title: "Workflow Pipeline",
+            title: l10n.t("Workflow Pipeline", "工作流阶段"),
             systemImage: "point.3.connected.trianglepath.dotted"
         ) {
             HStack(spacing: 6) {
@@ -72,8 +89,8 @@ struct FlowTabView: View {
                             Circle()
                                 .fill(
                                     isDoneStep
-                                        ? Color.green.opacity(0.18)
-                                        : (isCurrent ? Color.accentColor.opacity(0.2) : Color.primary.opacity(0.06))
+                                        ? Color.green.opacity(0.2)
+                                        : (isCurrent ? Color.accentColor.opacity(0.22) : Color.primary.opacity(0.08))
                                 )
                                 .frame(width: 20, height: 20)
                             if isDoneStep {
@@ -87,21 +104,21 @@ struct FlowTabView: View {
                             }
                         }
 
-                        Text(phase.label)
+                        Text(l10n.phaseLabel(phase))
                             .font(.system(size: 11.5, weight: isCurrent ? .semibold : .medium))
-                            .foregroundStyle(isCurrent ? .primary : (isDoneStep ? .secondary : .tertiary))
+                            .foregroundStyle(isCurrent ? .primary : .secondary)
                             .lineLimit(1)
                     }
                     .padding(.horizontal, 6)
                     .padding(.vertical, 4)
                     .background(
-                        isCurrent ? Color.accentColor.opacity(0.1) : Color.clear,
+                        isCurrent ? Color.accentColor.opacity(0.12) : Color.clear,
                         in: Capsule()
                     )
 
                     if idx < WorkflowPhase.allCases.count - 1 {
                         Rectangle()
-                            .fill(isDoneStep ? Color.green.opacity(0.4) : Color.primary.opacity(0.1))
+                            .fill(isDoneStep ? Color.green.opacity(0.45) : Color.primary.opacity(0.14))
                             .frame(height: 1)
                             .frame(maxWidth: .infinity)
                             .padding(.horizontal, 2)
@@ -116,27 +133,26 @@ struct FlowTabView: View {
                         .foregroundStyle(.orange)
                     Text(warning)
                         .font(.system(size: 11))
-                        .foregroundStyle(.primary.opacity(0.85))
+                        .foregroundStyle(.primary.opacity(0.9))
                 }
                 .padding(.horizontal, 8)
                 .padding(.vertical, 6)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 7))
+                .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
             }
 
-            // Honest artifact gate readiness row
             HStack(spacing: 6) {
-                artifactChip("PRD", ready: task.artifacts.hasPrd)
-                artifactChip("Design", ready: task.artifacts.hasDesign)
-                artifactChip("Implement", ready: task.artifacts.hasImplement)
+                artifactChip(l10n.t("PRD", "需求 PRD"), ready: task.artifacts.hasPrd)
+                artifactChip(l10n.t("Design", "设计"), ready: task.artifacts.hasDesign)
+                artifactChip(l10n.t("Implement", "实施"), ready: task.artifacts.hasImplement)
                 if task.artifacts.researchCount > 0 {
-                    StatusPill(text: "Research ×\(task.artifacts.researchCount)", color: .secondary)
+                    StatusPill(text: l10n.t("Research ×\(task.artifacts.researchCount)", "调研 ×\(task.artifacts.researchCount)"), color: .secondary)
                 }
                 if task.artifacts.implContextCount > 0 {
-                    StatusPill(text: "Impl Ctx \(task.artifacts.implContextCount)", color: .secondary)
+                    StatusPill(text: l10n.t("Impl Ctx \(task.artifacts.implContextCount)", "实施上下文 \(task.artifacts.implContextCount)"), color: .secondary)
                 }
                 if task.artifacts.checkContextCount > 0 {
-                    StatusPill(text: "Check Ctx \(task.artifacts.checkContextCount)", color: .secondary)
+                    StatusPill(text: l10n.t("Check Ctx \(task.artifacts.checkContextCount)", "校验上下文 \(task.artifacts.checkContextCount)"), color: .secondary)
                 }
                 Spacer(minLength: 0)
             }
@@ -153,20 +169,22 @@ struct FlowTabView: View {
 
     // MARK: - Real Markdown Checklist Progress (or Honest Artifact Readiness)
 
-    private func checklistOrArtifactCard(task: TaskSnapshot) -> some View {
+    private func checklistOrArtifactCard(task: TaskSnapshot, l10n: L10n) -> some View {
         let total = task.totalChecklistCount
         let done = task.completedChecklistCount
 
         return WorkbenchCard(
-            title: total > 0 ? "Checklist Progress" : "Task Artifacts & Subtasks",
+            title: total > 0
+                ? l10n.t("Checklist Progress", "清单完成进度")
+                : l10n.t("Task Artifacts & Subtasks", "任务文档与子任务"),
             systemImage: total > 0 ? "checklist" : "doc.text"
         ) {
             if total > 0 {
-                Text("\(done) / \(total) completed")
+                Text(l10n.t("\(done) / \(total) completed", "已完成 \(done) / \(total)"))
                     .font(.system(size: 11, weight: .semibold, design: .monospaced))
                     .foregroundStyle(done == total ? Color.green : Color.primary)
             } else {
-                Text("No markdown checkboxes yet")
+                Text(l10n.t("No markdown checkboxes yet", "暂无 Markdown 复选框"))
                     .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)
             }
@@ -205,7 +223,7 @@ struct FlowTabView: View {
                                             if let sec = item.section, !sec.isEmpty {
                                                 Text("\(sec) · L\(item.lineNumber)")
                                                     .font(.system(size: 9.5, design: .monospaced))
-                                                    .foregroundStyle(.tertiary)
+                                                    .foregroundStyle(.secondary)
                                             }
                                         }
                                     }
@@ -224,22 +242,23 @@ struct FlowTabView: View {
                                     .foregroundStyle(.secondary)
                                 Spacer()
                             }
+                            .contentShape(Rectangle())
                         }
                     }
                 }
             } else {
-                // Honest artifact & subtask overview — never fabricate a fake percentage
                 VStack(alignment: .leading, spacing: 6) {
                     if !task.artifacts.documentPaths.isEmpty {
                         HStack(spacing: 6) {
                             ForEach(task.artifacts.documentPaths.prefix(5), id: \.self) { docPath in
                                 Button {
                                     store.loadDocument(docPath)
+                                    store.docsSubMode = .taskDocs
                                     store.selectedTab = .docsSpecs
                                 } label: {
                                     StatusPill(text: docPath, color: .accentColor, systemImage: "doc.plaintext")
                                 }
-                                .buttonStyle(.plain)
+                                .buttonStyle(InteractiveSurfaceButtonStyle(isCapsule: true))
                             }
                             if task.artifacts.documentPaths.count > 5 {
                                 Text("+\(task.artifacts.documentPaths.count - 5)")
@@ -248,13 +267,16 @@ struct FlowTabView: View {
                             }
                         }
                     } else {
-                        Text("Add `- [ ]` acceptance criteria in prd.md or implement.md to track checklist progress here.")
-                            .font(.system(size: 11.5))
-                            .foregroundStyle(.secondary)
+                        Text(l10n.t(
+                            "Add `- [ ]` acceptance criteria in prd.md or implement.md to track checklist progress here.",
+                            "在 prd.md 或 implement.md 中添加 `- [ ]` 验收项即可在此追踪真实进度。"
+                        ))
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
                     }
 
                     if !task.record.subtasks.isEmpty {
-                        Divider().opacity(0.4)
+                        Divider().opacity(0.45)
                         ForEach(Array(task.record.subtasks.enumerated()), id: \.offset) { _, sub in
                             HStack(spacing: 6) {
                                 Image(systemName: sub.isCompleted ? "checkmark.circle.fill" : "circle")
@@ -271,14 +293,23 @@ struct FlowTabView: View {
         }
     }
 
-    // MARK: - Git & Spec Governance Card
+    // MARK: - Git & Spec Governance Card (Precomputed O(1) Lookup)
 
-    private var gitAndSpecCard: some View {
+    private func gitAndSpecCard(l10n: L10n) -> some View {
         let git = store.gitStatus
         let uncoveredCount = store.uncoveredModifiedFiles.count
+        let specsByModifiedFile: [String: [SpecDocument]] = {
+            var map: [String: [SpecDocument]] = [:]
+            for spec in store.specs {
+                for path in spec.matchedModifiedFiles {
+                    map[path, default: []].append(spec)
+                }
+            }
+            return map
+        }()
 
         return WorkbenchCard(
-            title: "Git & Spec Governance",
+            title: l10n.t("Git & Spec Governance", "Git 与规范治理"),
             systemImage: "arrow.triangle.branch"
         ) {
             HStack(spacing: 6) {
@@ -291,19 +322,21 @@ struct FlowTabView: View {
                         )
                     }
                     if git.isWorktree {
-                        StatusPill(text: "Worktree", color: .purple)
+                        StatusPill(text: l10n.t("Worktree", "工作树"), color: .purple)
                     }
                     if git.ahead > 0 || git.behind > 0 {
                         StatusPill(text: "↑\(git.ahead) ↓\(git.behind)", color: .secondary)
                     }
                     StatusPill(
-                        text: git.isClean ? "Clean" : "\(git.changes.count) dirty",
+                        text: git.isClean
+                            ? l10n.t("Clean", "干净")
+                            : l10n.t("\(git.changes.count) dirty", "\(git.changes.count) 处改动"),
                         color: git.isClean ? .green : .orange
                     )
                 } else {
-                    Text("No git status")
+                    Text(l10n.t("No git status", "无 Git 状态"))
                         .font(.system(size: 10.5))
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.secondary)
                 }
             }
         } content: {
@@ -313,11 +346,15 @@ struct FlowTabView: View {
                         Image(systemName: "exclamationmark.shield.fill")
                             .font(.system(size: 11))
                             .foregroundStyle(.orange)
-                        Text("\(uncoveredCount) modified \(uncoveredCount == 1 ? "file has" : "files have") zero .trellis/spec/ coverage")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(.primary.opacity(0.9))
+                        Text(l10n.t(
+                            "\(uncoveredCount) modified \(uncoveredCount == 1 ? "file has" : "files have") zero .trellis/spec/ coverage",
+                            "\(uncoveredCount) 个改动文件缺少 .trellis/spec/ 规范覆盖"
+                        ))
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.primary.opacity(0.92))
                         Spacer()
-                        Button("Inspect Specs") {
+                        Button(l10n.t("Inspect Specs", "查看规范")) {
+                            store.docsSubMode = .projectSpecs
                             store.selectedTab = .docsSpecs
                         }
                         .font(.system(size: 10.5, weight: .medium))
@@ -325,23 +362,23 @@ struct FlowTabView: View {
                     }
                     .padding(.horizontal, 8)
                     .padding(.vertical, 6)
-                    .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 7))
+                    .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
                 }
 
                 if git.changes.isEmpty {
-                    Text("Working tree is clean. All changes committed.")
+                    Text(l10n.t("Working tree is clean. All changes committed.", "工作区干净，所有改动均已提交。"))
                         .font(.system(size: 11.5))
                         .foregroundStyle(.secondary)
                 } else {
                     VStack(alignment: .leading, spacing: 5) {
                         ForEach(git.changes.prefix(12)) { change in
-                            let matchedSpecs = store.specsForModifiedFile(change.path)
+                            let matchedSpecs = specsByModifiedFile[change.path] ?? []
                             HStack(alignment: .center, spacing: 6) {
                                 Text(HUDVisuals.shortBadge(for: change.kind))
                                     .font(.system(size: 9.5, weight: .bold, design: .monospaced))
                                     .foregroundStyle(HUDVisuals.color(for: change.kind))
                                     .frame(width: 15, height: 15)
-                                    .background(HUDVisuals.color(for: change.kind).opacity(0.14), in: RoundedRectangle(cornerRadius: 3.5))
+                                    .background(HUDVisuals.color(for: change.kind).opacity(0.16), in: RoundedRectangle(cornerRadius: 3.5))
 
                                 Text(change.path)
                                     .font(.system(size: 11, design: .monospaced))
@@ -352,17 +389,16 @@ struct FlowTabView: View {
                                 Spacer(minLength: 6)
 
                                 if matchedSpecs.isEmpty {
-                                    StatusPill(text: "No spec", color: .orange)
+                                    StatusPill(text: l10n.t("No spec", "无规范"), color: .orange)
                                 } else {
                                     HStack(spacing: 4) {
                                         ForEach(matchedSpecs.prefix(2)) { spec in
                                             Button {
-                                                store.selectSpec(spec.relativePath)
-                                                store.selectedTab = .docsSpecs
+                                                store.openSpecInDocsTab(spec.relativePath)
                                             } label: {
                                                 StatusPill(text: spec.name, color: .green, systemImage: "checkmark.shield")
                                             }
-                                            .buttonStyle(.plain)
+                                            .buttonStyle(InteractiveSurfaceButtonStyle(isCapsule: true))
                                         }
                                         if matchedSpecs.count > 2 {
                                             Text("+\(matchedSpecs.count - 2)")
@@ -374,38 +410,47 @@ struct FlowTabView: View {
                             }
                         }
                         if git.changes.count > 12 {
-                            Text("…and \(git.changes.count - 12) more modified files")
-                                .font(.system(size: 10.5))
-                                .foregroundStyle(.tertiary)
-                                .padding(.top, 2)
+                            Text(l10n.t(
+                                "…and \(git.changes.count - 12) more modified files",
+                                "…以及其余 \(git.changes.count - 12) 个改动文件"
+                            ))
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                            .padding(.top, 2)
                         }
                     }
                 }
             } else {
-                Text("Select a Git repository to inspect branch state and .trellis/spec/ coverage.")
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(.secondary)
+                Text(l10n.t(
+                    "Select a Git repository to inspect branch state and .trellis/spec/ coverage.",
+                    "选择 Git 仓库以查看分支状态与 .trellis/spec/ 覆盖情况。"
+                ))
+                .font(.system(size: 11.5))
+                .foregroundStyle(.secondary)
             }
         }
     }
 
     // MARK: - Chronological Tool / Activity Trace
 
-    private var activityTraceCard: some View {
+    private func activityTraceCard(l10n: L10n) -> some View {
         let entries = Array(store.currentTaskActivities.prefix(12))
 
         return WorkbenchCard(
-            title: "Recent Activity Trace",
+            title: l10n.t("Recent Activity Trace", "最近工具与活动轨迹"),
             systemImage: "list.bullet.rectangle"
         ) {
-            Text("\(store.currentTaskActivities.count) events")
+            Text(l10n.t("\(store.currentTaskActivities.count) events", "\(store.currentTaskActivities.count) 条事件"))
                 .font(.system(size: 10.5, design: .monospaced))
                 .foregroundStyle(.secondary)
         } content: {
             if entries.isEmpty {
-                Text("No live tool events yet. Hook events from Claude Code, Codex, Cursor, Pi, OpenCode, or DSH appear here in real time.")
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(.secondary)
+                Text(l10n.t(
+                    "No live tool events yet. Hook events from Claude Code, Codex, Cursor, Pi, OpenCode, or DSH appear here in real time.",
+                    "暂无实时工具事件。来自 Claude Code、Codex、Cursor、Pi、OpenCode 或 DSH 的 Hook 事件将实时显示在此。"
+                ))
+                .font(.system(size: 11.5))
+                .foregroundStyle(.secondary)
             } else {
                 VStack(alignment: .leading, spacing: 5) {
                     ForEach(entries) { entry in
@@ -416,7 +461,7 @@ struct FlowTabView: View {
 
                             Text(HUDVisuals.shortTime(entry.timestamp))
                                 .font(.system(size: 10, design: .monospaced))
-                                .foregroundStyle(.tertiary)
+                                .foregroundStyle(.secondary)
 
                             Image(systemName: HUDVisuals.icon(for: entry.agent))
                                 .font(.system(size: 10))
@@ -429,12 +474,12 @@ struct FlowTabView: View {
                                     .foregroundStyle(.primary)
                                     .padding(.horizontal, 5)
                                     .padding(.vertical, 1)
-                                    .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 4))
+                                    .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 4))
                             }
 
                             Text(entry.targetPath.map { "\($0) — \(entry.summary)" } ?? entry.summary)
                                 .font(.system(size: 11))
-                                .foregroundStyle(.primary.opacity(0.86))
+                                .foregroundStyle(.primary.opacity(0.9))
                                 .lineLimit(1)
                                 .truncationMode(.middle)
 
@@ -448,13 +493,27 @@ struct FlowTabView: View {
 
     // MARK: - Action Output Drawer & Human-Gate Action Bar
 
-    private func actionOutputDrawer(_ result: ActionResult) -> some View {
+    private func runningActionDrawer(_ action: ActionKind, l10n: L10n) -> some View {
+        HStack(spacing: 8) {
+            ProgressView()
+                .controlSize(.mini)
+            Text(l10n.t("Running \(action.rawValue)…", "正在执行 \(actionLabel(action, l10n: l10n))…"))
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundStyle(.primary)
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.9))
+    }
+
+    private func actionOutputDrawer(_ result: ActionResult, l10n: L10n) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Image(systemName: result.success ? "checkmark.circle.fill" : "xmark.octagon.fill")
                     .font(.system(size: 11))
                     .foregroundStyle(result.success ? Color.green : Color.red)
-                Text("\(result.action.rawValue.capitalized) (\(result.durationMs)ms · exit \(result.exitCode))")
+                Text("\(actionLabel(result.action, l10n: l10n)) (\(result.durationMs)ms · exit \(result.exitCode))")
                     .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
                 Spacer()
                 Button {
@@ -463,8 +522,9 @@ struct FlowTabView: View {
                     Image(systemName: "xmark")
                         .font(.system(size: 9.5, weight: .semibold))
                         .foregroundStyle(.secondary)
+                        .frame(width: 20, height: 20)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(InteractiveSurfaceButtonStyle(cornerRadius: 4))
             }
             let combined = [result.message, result.stdout, result.stderr]
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -474,7 +534,7 @@ struct FlowTabView: View {
                 ScrollView {
                     Text(combined)
                         .font(.system(size: 10.5, design: .monospaced))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.primary.opacity(0.88))
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .textSelection(.enabled)
                 }
@@ -483,15 +543,15 @@ struct FlowTabView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
-        .background(Color.primary.opacity(0.045))
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.92))
     }
 
-    private var humanGateActionBar: some View {
+    private func humanGateActionBar(l10n: L10n) -> some View {
         HStack(spacing: 8) {
             Button {
                 store.jumpToTerminal()
             } label: {
-                Label("Jump to Terminal", systemImage: "terminal")
+                Label(l10n.t("Jump to Terminal", "跳转终端"), systemImage: "terminal")
                     .font(.system(size: 11.5, weight: .medium))
             }
             .buttonStyle(.bordered)
@@ -499,29 +559,25 @@ struct FlowTabView: View {
 
             Spacer(minLength: 4)
 
-            if store.lastActionResult != nil {
+            if store.lastActionResult != nil && store.runningAction == nil {
                 Button {
-                    withAnimation(.easeInOut(duration: 0.15)) {
-                        showActionOutput.toggle()
-                    }
+                    showActionOutput.toggle()
                 } label: {
                     Image(systemName: showActionOutput ? "chevron.down.square" : "doc.text.magnifyingglass")
-                        .font(.system(size: 11))
+                        .font(.system(size: 11.5))
+                        .frame(width: 24, height: 22)
                 }
-                .buttonStyle(.borderless)
-                .help("Toggle last command output")
+                .buttonStyle(InteractiveSurfaceButtonStyle(cornerRadius: 5))
+                .help(l10n.t("Toggle last command output", "展开/收起上次命令输出"))
             }
 
-            gateActionButton(title: "Validate", icon: "checkmark.shield", action: .validate) {
-                showActionOutput = true
+            gateActionButton(title: l10n.t("Validate", "校验"), icon: "checkmark.shield", action: .validate) {
                 store.runValidate()
             }
-            gateActionButton(title: "Start", icon: "play.fill", action: .start) {
-                showActionOutput = true
+            gateActionButton(title: l10n.t("Start", "激活"), icon: "play.fill", action: .start) {
                 store.runStartTask()
             }
-            gateActionButton(title: "Archive", icon: "archivebox", action: .archive, prominent: true) {
-                showActionOutput = true
+            gateActionButton(title: l10n.t("Archive", "归档"), icon: "archivebox", action: .archive, prominent: true) {
                 store.runArchiveTask()
             }
         }
@@ -561,6 +617,17 @@ struct FlowTabView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .disabled(isDisabled)
+        }
+    }
+
+    private func actionLabel(_ action: ActionKind, l10n: L10n) -> String {
+        switch action {
+        case .validate: return l10n.t("Validate", "校验")
+        case .start: return l10n.t("Start", "激活")
+        case .archive: return l10n.t("Archive", "归档")
+        case .interruptWorker: return l10n.t("Interrupt", "中断")
+        case .killWorker: return l10n.t("Kill", "终止")
+        case .custom: return l10n.t("Command", "命令")
         }
     }
 

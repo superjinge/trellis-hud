@@ -2,18 +2,28 @@ import Darwin
 import Foundation
 import TrellisCore
 
-/// POSIX `AF_UNIX` stream socket server + inbox fallback queue poller.
-/// Wire-compatible with `trellis-card`'s `/tmp/trellis-card-<fnv1a>.sock` newline-JSON protocol.
+/// POSIX `AF_UNIX` stream socket server + event-driven inbox fallback watcher.
+/// Delegates FNV-1a socket hashing, `0600` owner-only permissions, NDJSON decoding, and inbox draining
+/// directly to `TrellisCore.ConfigStore` & `TrellisCore.UnixSocketProtocol`.
 public final class HUDUnixSocketServer: @unchecked Sendable {
-    private let queue = DispatchQueue(label: "com.superjinge.trellis-hud.ipc", qos: .userInitiated)
+    private static let maxClientPayloadBytes = 2 * 1024 * 1024 // 2 MiB safety cap
+
+    private let queue = DispatchQueue(label: "com.superjinge.trellis-hud.ipc.accept", qos: .userInitiated)
+    private let clientReadQueue = DispatchQueue(
+        label: "com.superjinge.trellis-hud.ipc.client-read",
+        qos: .utility,
+        attributes: .concurrent
+    )
+    private let queueKey = DispatchSpecificKey<UInt8>()
     private let socketPaths: [String]
     private let inboxDirs: [URL]
     private let onEvents: @Sendable ([HookEvent]) -> Void
 
     private var serverSockets: [Int32] = []
     private var acceptSources: [DispatchSourceRead] = []
-    private var inboxTimer: DispatchSourceTimer?
-    private let decoder = JSONDecoder()
+    private var inboxWatchSources: [DispatchSourceFileSystemObject] = []
+    private var inboxWatchFDs: [Int32] = []
+    private var fallbackTimer: DispatchSourceTimer?
 
     public init(
         socketPaths: [String]? = nil,
@@ -23,23 +33,25 @@ public final class HUDUnixSocketServer: @unchecked Sendable {
         self.socketPaths = socketPaths ?? Self.defaultSocketPaths()
         self.inboxDirs = inboxDirs ?? Self.defaultInboxDirs()
         self.onEvents = onEvents
+        self.queue.setSpecific(key: queueKey, value: 1)
     }
 
     deinit {
         stop()
     }
 
-    /// Computes both the macOS `Application Support/trellis-card` hash (used by Rust `dirs::config_dir()`)
-    /// and the `~/.config/trellis-card` hash so existing `trellis-card` hooks AND new Swift hooks deliver seamlessly.
+    /// Computes both `Application Support/trellis-card` (canonical macOS `ConfigStore`) and `~/.config/trellis-card`
+    /// socket paths via `TrellisCore.ConfigStore.socketPath(for:)` so legacy & new hooks both deliver cleanly.
     public static func defaultSocketPaths() -> [String] {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        let appSupportDir = home
-            .appendingPathComponent("Library/Application Support/trellis-card").path
-        let dotConfigDir = home
-            .appendingPathComponent(".config/trellis-card").path
+        let candidates = [
+            ConfigStore.defaultConfigDir().path,
+            home.appendingPathComponent("Library/Application Support/trellis-card").path,
+            home.appendingPathComponent(".config/trellis-card").path,
+        ]
         var result: [String] = []
-        for dir in [appSupportDir, dotConfigDir] {
-            let sock = "/tmp/trellis-card-\(fnv1aHex(dir)).sock"
+        for dir in candidates {
+            let sock = ConfigStore.socketPath(for: dir)
             if !result.contains(sock) {
                 result.append(sock)
             }
@@ -49,19 +61,16 @@ public final class HUDUnixSocketServer: @unchecked Sendable {
 
     public static func defaultInboxDirs() -> [URL] {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        return [
+        let urls = [
+            ConfigStore.defaultConfigDir().appendingPathComponent("inbox", isDirectory: true),
             home.appendingPathComponent("Library/Application Support/trellis-card/inbox", isDirectory: true),
             home.appendingPathComponent(".config/trellis-card/inbox", isDirectory: true),
         ]
-    }
-
-    public static func fnv1aHex(_ string: String) -> String {
-        var hash: UInt64 = 0xcbf29ce484222325
-        for byte in string.utf8 {
-            hash ^= UInt64(byte)
-            hash = hash &* 0x100000001b3
+        var unique: [URL] = []
+        for u in urls where !unique.contains(where: { $0.path == u.path }) {
+            unique.append(u)
         }
-        return String(format: "%016llx", hash)
+        return unique
     }
 
     public func start() {
@@ -71,19 +80,34 @@ public final class HUDUnixSocketServer: @unchecked Sendable {
             for path in self.socketPaths {
                 self.bindSocketLocked(at: path)
             }
-            self.startInboxPollerLocked()
+            self.drainInboxesLocked()
+            self.startInboxWatchersLocked()
         }
     }
 
+    /// Safe to invoke from any queue, including `deinit` running on `self.queue` (avoids `queue.sync` deadlock).
     public func stop() {
-        queue.sync {
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
             stopLocked()
+        } else {
+            queue.sync {
+                stopLocked()
+            }
         }
     }
 
     private func stopLocked() {
-        inboxTimer?.cancel()
-        inboxTimer = nil
+        fallbackTimer?.cancel()
+        fallbackTimer = nil
+
+        for source in inboxWatchSources {
+            source.cancel()
+        }
+        inboxWatchSources.removeAll()
+        for fd in inboxWatchFDs {
+            Darwin.close(fd)
+        }
+        inboxWatchFDs.removeAll()
 
         for source in acceptSources {
             source.cancel()
@@ -108,7 +132,6 @@ public final class HUDUnixSocketServer: @unchecked Sendable {
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return }
 
-        // Set non-blocking for DispatchSourceRead
         let flags = fcntl(fd, F_GETFL, 0)
         if flags >= 0 {
             _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
@@ -140,6 +163,9 @@ public final class HUDUnixSocketServer: @unchecked Sendable {
             return
         }
 
+        // Restrict socket permissions strictly to the current user (0600)
+        UnixSocketProtocol.setOwnerOnlyPermissions(socketPath: path)
+
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
         source.setEventHandler { [weak self] in
             self?.acceptPendingConnectionsLocked(serverFD: fd)
@@ -162,13 +188,18 @@ public final class HUDUnixSocketServer: @unchecked Sendable {
             if clientFD < 0 {
                 break
             }
-            readClientPayload(fd: clientFD)
+            let deliver = onEvents
+            clientReadQueue.async {
+                Self.readClientPayload(fd: clientFD, onEvents: deliver)
+            }
         }
     }
 
-    private func readClientPayload(fd: Int32) {
+    private static func readClientPayload(
+        fd: Int32,
+        onEvents: @escaping @Sendable ([HookEvent]) -> Void
+    ) {
         defer { Darwin.close(fd) }
-        // Make sure client read has a short timeout so a misbehaving client never stalls the server
         var timeout = timeval(tv_sec: 1, tv_usec: 0)
         _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
 
@@ -177,67 +208,85 @@ public final class HUDUnixSocketServer: @unchecked Sendable {
         while true {
             let count = Darwin.read(fd, &buffer, buffer.count)
             if count > 0 {
-                data.append(contentsOf: buffer[0..<count])
-                if data.count > 262_144 { break } // 256 KB safety cap
+                let remaining = maxClientPayloadBytes - data.count
+                if remaining <= 0 { break }
+                data.append(contentsOf: buffer[0..<min(count, remaining)])
+                if data.count >= maxClientPayloadBytes { break }
             } else {
                 break
             }
         }
 
         guard let text = String(data: data, encoding: .utf8), !text.isEmpty else { return }
-        let events = decodeLines(text)
+        var events: [HookEvent] = []
+        for rawLine in text.split(whereSeparator: \.isNewline) {
+            let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            if let event = try? UnixSocketProtocol.decodeEvent(trimmed) {
+                events.append(event)
+            }
+        }
         if !events.isEmpty {
             onEvents(events)
         }
     }
 
-    private func startInboxPollerLocked() {
+    private func startInboxWatchersLocked() {
+        for dir in inboxDirs {
+            attachVnodeWatcherLocked(for: dir)
+        }
+        // Low-power 3-second fallback handles inboxes created after startup (replaces 250ms busy polling).
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + .milliseconds(250), repeating: .milliseconds(250))
+        timer.schedule(deadline: .now() + .seconds(3), repeating: .seconds(3), leeway: .milliseconds(500))
         timer.setEventHandler { [weak self] in
-            self?.drainInboxesLocked()
+            guard let self else { return }
+            self.drainInboxesLocked()
+            if self.inboxWatchSources.count < self.inboxDirs.count {
+                self.reattachMissingVnodeWatchersLocked()
+            }
         }
         timer.resume()
-        inboxTimer = timer
+        fallbackTimer = timer
+    }
+
+    private func attachVnodeWatcherLocked(for dir: URL) {
+        let fd = Darwin.open(dir.path, O_EVTONLY)
+        guard fd >= 0 else { return }
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .extend, .rename],
+            queue: queue
+        )
+        source.setEventHandler { [weak self] in
+            self?.drainInboxesLocked()
+        }
+        source.resume()
+        inboxWatchFDs.append(fd)
+        inboxWatchSources.append(source)
+    }
+
+    private func reattachMissingVnodeWatchersLocked() {
+        let existingCount = inboxWatchSources.count
+        guard existingCount < inboxDirs.count else { return }
+        for source in inboxWatchSources { source.cancel() }
+        inboxWatchSources.removeAll()
+        for fd in inboxWatchFDs { Darwin.close(fd) }
+        inboxWatchFDs.removeAll()
+        for dir in inboxDirs {
+            attachVnodeWatcherLocked(for: dir)
+        }
     }
 
     private func drainInboxesLocked() {
         var collected: [HookEvent] = []
-        let fm = FileManager.default
-
         for dir in inboxDirs {
-            guard let items = try? fm.contentsOfDirectory(
-                at: dir,
-                includingPropertiesForKeys: nil,
-                options: [.skipsHiddenFiles]
-            ) else { continue }
-
-            let jsonFiles = items
-                .filter { $0.pathExtension == "json" }
-                .sorted { $0.lastPathComponent < $1.lastPathComponent }
-
-            for fileURL in jsonFiles {
-                if let text = try? String(contentsOf: fileURL, encoding: .utf8) {
-                    collected.append(contentsOf: decodeLines(text))
-                }
-                try? fm.removeItem(at: fileURL)
+            let events = UnixSocketProtocol.drainQueue(dir: dir)
+            if !events.isEmpty {
+                collected.append(contentsOf: events)
             }
         }
-
         if !collected.isEmpty {
             onEvents(collected)
         }
-    }
-
-    private func decodeLines(_ text: String) -> [HookEvent] {
-        var results: [HookEvent] = []
-        for rawLine in text.split(whereSeparator: \.isNewline) {
-            let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty, let lineData = trimmed.data(using: .utf8) else { continue }
-            if let event = try? decoder.decode(HookEvent.self, from: lineData) {
-                results.append(event)
-            }
-        }
-        return results
     }
 }

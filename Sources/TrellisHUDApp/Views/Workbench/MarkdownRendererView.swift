@@ -5,16 +5,14 @@ import SwiftUI
 // MARK: - Parsed Markdown AST
 
 struct MarkdownDocument: Sendable, Equatable {
-    var frontmatter: [(key: String, value: String)]
+    struct FrontmatterEntry: Sendable, Equatable {
+        var key: String
+        var value: String
+    }
+
+    var frontmatter: [FrontmatterEntry]
     var leadingBlocks: [MarkdownBlock]
     var sections: [MarkdownSection]
-
-    static func == (lhs: MarkdownDocument, rhs: MarkdownDocument) -> Bool {
-        lhs.leadingBlocks == rhs.leadingBlocks
-            && lhs.sections == rhs.sections
-            && lhs.frontmatter.map(\.key) == rhs.frontmatter.map(\.key)
-            && lhs.frontmatter.map(\.value) == rhs.frontmatter.map(\.value)
-    }
 }
 
 struct MarkdownSection: Identifiable, Sendable, Equatable {
@@ -84,6 +82,164 @@ enum MarkdownBlock: Identifiable, Sendable, Equatable {
     }
 }
 
+// MARK: - Bounded Caches (Zero Re-Parse on Hover/Toast/Tab Ticks)
+
+@MainActor
+private enum MarkdownDocumentCache {
+    private static var storage: [String: MarkdownDocument] = [:]
+    private static var order: [String] = []
+    private static let maxEntries = 64
+
+    static func document(for source: String) -> MarkdownDocument {
+        if let cached = storage[source] {
+            return cached
+        }
+        let parsed = MarkdownParser.parse(source)
+        if storage.count >= maxEntries, let oldest = order.first {
+            order.removeFirst()
+            storage.removeValue(forKey: oldest)
+        }
+        storage[source] = parsed
+        order.append(source)
+        return parsed
+    }
+}
+
+@MainActor
+private enum InlineMarkdownCache {
+    private static var storage: [String: AttributedString] = [:]
+    private static var order: [String] = []
+    private static let maxEntries = 512
+
+    static func attributedString(for raw: String) -> AttributedString {
+        if let cached = storage[raw] {
+            return cached
+        }
+        let parsed = InlineMarkdownParser.parse(raw)
+        if storage.count >= maxEntries, let oldest = order.first {
+            order.removeFirst()
+            storage.removeValue(forKey: oldest)
+        }
+        storage[raw] = parsed
+        order.append(raw)
+        return parsed
+    }
+}
+
+// MARK: - CJK-Safe Inline Markdown Parser
+// Resolves CommonMark §6.2 flanking failures where `**` borders CJK punctuation (`「」（）【】《》`).
+
+enum InlineMarkdownParser {
+    private static let parseOptions = AttributedString.MarkdownParsingOptions(
+        interpretedSyntax: .inlineOnlyPreservingWhitespace
+    )
+
+    static func parse(_ raw: String) -> AttributedString {
+        guard raw.contains("**") else {
+            return parseStandardInline(raw)
+        }
+
+        var output = AttributedString()
+        var idx = raw.startIndex
+        var plainStart = raw.startIndex
+
+        func flushPlain(upTo end: String.Index) {
+            guard plainStart < end else { return }
+            let segment = String(raw[plainStart..<end])
+            output.append(parseStandardInline(segment))
+            plainStart = end
+        }
+
+        while idx < raw.endIndex {
+            // Skip inline code spans (`...` or ``...``) untouched
+            if raw[idx] == "`" {
+                var ticksEnd = idx
+                while ticksEnd < raw.endIndex && raw[ticksEnd] == "`" {
+                    ticksEnd = raw.index(after: ticksEnd)
+                }
+                let tickCount = raw.distance(from: idx, to: ticksEnd)
+                let closingFence = String(repeating: "`", count: tickCount)
+                if let closeRange = raw.range(of: closingFence, range: ticksEnd..<raw.endIndex) {
+                    idx = closeRange.upperBound
+                    continue
+                } else {
+                    idx = ticksEnd
+                    continue
+                }
+            }
+
+            // Detect `**` (not escaped with `\`)
+            if raw[idx] == "*" {
+                let nextIdx = raw.index(after: idx)
+                let isEscaped = idx > raw.startIndex && raw[raw.index(before: idx)] == "\\"
+                if !isEscaped, nextIdx < raw.endIndex, raw[nextIdx] == "*" {
+                    let contentStart = raw.index(after: nextIdx)
+                    if let closing = findClosingDoubleStar(in: raw, from: contentStart),
+                       closing > contentStart {
+                        let inner = String(raw[contentStart..<closing])
+                        if !inner.trimmingCharacters(in: .whitespaces).isEmpty {
+                            flushPlain(upTo: idx)
+                            var boldRun = parseStandardInline(inner)
+                            for run in boldRun.runs {
+                                let existing = run.inlinePresentationIntent ?? []
+                                boldRun[run.range].inlinePresentationIntent = existing.union(.stronglyEmphasized)
+                            }
+                            output.append(boldRun)
+                            let afterClose = raw.index(closing, offsetBy: 2)
+                            idx = afterClose
+                            plainStart = afterClose
+                            continue
+                        }
+                    }
+                }
+            }
+
+            idx = raw.index(after: idx)
+        }
+
+        flushPlain(upTo: raw.endIndex)
+        return output
+    }
+
+    private static func findClosingDoubleStar(in text: String, from start: String.Index) -> String.Index? {
+        var i = start
+        while i < text.endIndex {
+            // Respect inline code spans inside bold text (e.g. **`foo`**)
+            if text[i] == "`" {
+                var ticksEnd = i
+                while ticksEnd < text.endIndex && text[ticksEnd] == "`" {
+                    ticksEnd = text.index(after: ticksEnd)
+                }
+                let tickCount = text.distance(from: i, to: ticksEnd)
+                let fence = String(repeating: "`", count: tickCount)
+                if let closeRange = text.range(of: fence, range: ticksEnd..<text.endIndex) {
+                    i = closeRange.upperBound
+                    continue
+                }
+                i = ticksEnd
+                continue
+            }
+
+            if text[i] == "*" {
+                let next = text.index(after: i)
+                let isEscaped = i > start && text[text.index(before: i)] == "\\"
+                if !isEscaped, next < text.endIndex, text[next] == "*" {
+                    return i
+                }
+            }
+            i = text.index(after: i)
+        }
+        return nil
+    }
+
+    private static func parseStandardInline(_ text: String) -> AttributedString {
+        if let attributed = try? AttributedString(markdown: text, options: parseOptions) {
+            return attributed
+        }
+        return AttributedString(text)
+    }
+}
+
 // MARK: - GFM Parser
 
 enum MarkdownParser {
@@ -127,7 +283,7 @@ enum MarkdownParser {
     private static func parseFrontmatter(
         lines: [String],
         cursor: inout Int
-    ) -> [(key: String, value: String)] {
+    ) -> [MarkdownDocument.FrontmatterEntry] {
         guard lines.count >= 3,
               lines[0].trimmingCharacters(in: .whitespaces) == "---" else {
             return []
@@ -143,13 +299,13 @@ enum MarkdownParser {
         }
         guard let end = endIndex else { return [] }
 
-        var entries: [(key: String, value: String)] = []
+        var entries: [MarkdownDocument.FrontmatterEntry] = []
         var currentKey: String?
         var listValues: [String] = []
 
         func flushCurrent() {
             if let key = currentKey, !listValues.isEmpty {
-                entries.append((key: key, value: listValues.joined(separator: ", ")))
+                entries.append(.init(key: key, value: listValues.joined(separator: ", ")))
             }
             currentKey = nil
             listValues = []
@@ -175,7 +331,7 @@ enum MarkdownParser {
                 if val.isEmpty {
                     currentKey = key
                 } else {
-                    entries.append((key: key, value: val))
+                    entries.append(.init(key: key, value: val))
                 }
             }
         }
@@ -255,8 +411,6 @@ enum MarkdownParser {
                         if content.hasPrefix(" ") { content.removeFirst() }
                         quoteLines.append(content)
                         i += 1
-                    } else if qt.isEmpty {
-                        break
                     } else {
                         break
                     }
@@ -488,22 +642,25 @@ enum MarkdownParser {
 
 // MARK: - SwiftUI Markdown Renderer View
 
-struct MarkdownRendererView: View {
+struct MarkdownRendererView: View, Equatable {
     let markdown: String
     var collapseSectionsByDefault: Bool = false
+    var isChinese: Bool = false
 
-    private var document: MarkdownDocument {
-        MarkdownParser.parse(markdown)
+    nonisolated static func == (lhs: MarkdownRendererView, rhs: MarkdownRendererView) -> Bool {
+        lhs.markdown == rhs.markdown
+            && lhs.collapseSectionsByDefault == rhs.collapseSectionsByDefault
+            && lhs.isChinese == rhs.isChinese
     }
 
     var body: some View {
-        let doc = document
+        let doc = MarkdownDocumentCache.document(for: markdown)
         if doc.frontmatter.isEmpty && doc.leadingBlocks.isEmpty && doc.sections.isEmpty {
             VStack(spacing: 6) {
                 Image(systemName: "doc.text")
                     .font(.title3)
-                    .foregroundStyle(.tertiary)
-                Text("Empty document")
+                    .foregroundStyle(.secondary)
+                Text(isChinese ? "空文档" : "Empty document")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -515,13 +672,14 @@ struct MarkdownRendererView: View {
                 }
 
                 ForEach(doc.leadingBlocks) { block in
-                    MarkdownBlockView(block: block)
+                    MarkdownBlockView(block: block, isChinese: isChinese)
                 }
 
                 ForEach(doc.sections) { section in
                     CollapsibleH2Section(
                         section: section,
-                        initiallyExpanded: !collapseSectionsByDefault
+                        initiallyExpanded: !collapseSectionsByDefault,
+                        isChinese: isChinese
                     )
                 }
             }
@@ -533,7 +691,7 @@ struct MarkdownRendererView: View {
 // MARK: - Frontmatter Strip
 
 private struct FrontmatterBar: View {
-    let entries: [(key: String, value: String)]
+    let entries: [MarkdownDocument.FrontmatterEntry]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -544,20 +702,20 @@ private struct FrontmatterBar: View {
                         .foregroundStyle(.secondary)
                         .padding(.horizontal, 5)
                         .padding(.vertical, 1.5)
-                        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 4))
+                        .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 4))
                     Text(entry.value)
                         .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(.primary.opacity(0.85))
+                        .foregroundStyle(.primary.opacity(0.9))
                         .lineLimit(2)
                 }
             }
         }
         .padding(8)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 7))
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.7), in: RoundedRectangle(cornerRadius: 7))
         .overlay(
             RoundedRectangle(cornerRadius: 7)
-                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+                .strokeBorder(Color(nsColor: .separatorColor).opacity(0.55), lineWidth: 0.75)
         )
     }
 }
@@ -566,10 +724,12 @@ private struct FrontmatterBar: View {
 
 private struct CollapsibleH2Section: View {
     let section: MarkdownSection
+    let isChinese: Bool
     @State private var isExpanded: Bool
 
-    init(section: MarkdownSection, initiallyExpanded: Bool) {
+    init(section: MarkdownSection, initiallyExpanded: Bool, isChinese: Bool) {
         self.section = section
+        self.isChinese = isChinese
         self._isExpanded = State(initialValue: initiallyExpanded)
     }
 
@@ -577,7 +737,7 @@ private struct CollapsibleH2Section: View {
         DisclosureGroup(isExpanded: $isExpanded) {
             VStack(alignment: .leading, spacing: 8) {
                 ForEach(section.blocks) { block in
-                    MarkdownBlockView(block: block)
+                    MarkdownBlockView(block: block, isChinese: isChinese)
                 }
             }
             .padding(.top, 6)
@@ -589,14 +749,14 @@ private struct CollapsibleH2Section: View {
                     .foregroundStyle(.primary)
                 Spacer(minLength: 4)
                 if !isExpanded && !section.blocks.isEmpty {
-                    Text("\(section.blocks.count) blocks")
+                    Text(isChinese ? "\(section.blocks.count) 块" : "\(section.blocks.count) blocks")
                         .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.secondary)
                 }
             }
             .contentShape(Rectangle())
             .onTapGesture {
-                withAnimation(.easeInOut(duration: 0.16)) {
+                withAnimation(.easeInOut(duration: 0.14)) {
                     isExpanded.toggle()
                 }
             }
@@ -609,6 +769,7 @@ private struct CollapsibleH2Section: View {
 
 private struct MarkdownBlockView: View {
     let block: MarkdownBlock
+    let isChinese: Bool
 
     var body: some View {
         switch block {
@@ -618,11 +779,11 @@ private struct MarkdownBlockView: View {
         case .paragraph(_, let text):
             InlineMarkdownText(text)
                 .font(.system(size: 12.5))
-                .foregroundStyle(.primary.opacity(0.92))
+                .foregroundStyle(.primary.opacity(0.95))
                 .fixedSize(horizontal: false, vertical: true)
 
         case .codeBlock(_, let language, let code):
-            MarkdownCodeBlockView(language: language, code: code)
+            MarkdownCodeBlockView(language: language, code: code, isChinese: isChinese)
 
         case .checklist(_, let items):
             VStack(alignment: .leading, spacing: 5) {
@@ -633,7 +794,7 @@ private struct MarkdownBlockView: View {
                             .foregroundStyle(item.checked ? Color.green : Color.secondary)
                         InlineMarkdownText(item.text)
                             .font(.system(size: 12.5))
-                            .strikethrough(item.checked, color: .secondary.opacity(0.7))
+                            .strikethrough(item.checked, color: .secondary.opacity(0.75))
                             .foregroundStyle(item.checked ? .secondary : .primary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -651,7 +812,7 @@ private struct MarkdownBlockView: View {
                             .frame(minWidth: ordered ? 18 : 10, alignment: .trailing)
                         InlineMarkdownText(item.text)
                             .font(.system(size: 12.5))
-                            .foregroundStyle(.primary.opacity(0.92))
+                            .foregroundStyle(.primary.opacity(0.95))
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     .padding(.leading, CGFloat(item.indent) * 14)
@@ -661,7 +822,7 @@ private struct MarkdownBlockView: View {
         case .blockquote(_, let lines):
             HStack(alignment: .top, spacing: 8) {
                 RoundedRectangle(cornerRadius: 1.5)
-                    .fill(Color.accentColor.opacity(0.55))
+                    .fill(Color.accentColor.opacity(0.7))
                     .frame(width: 3)
                 VStack(alignment: .leading, spacing: 3) {
                     ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
@@ -676,10 +837,10 @@ private struct MarkdownBlockView: View {
                     }
                 }
             }
-            .padding(.vertical, 4)
-            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .padding(.horizontal, 9)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 6))
+            .background(Color(nsColor: .controlBackgroundColor).opacity(0.65), in: RoundedRectangle(cornerRadius: 6))
 
         case .table(_, let headers, let alignments, let rows):
             MarkdownTableView(headers: headers, alignments: alignments, rows: rows)
@@ -709,7 +870,7 @@ private struct MarkdownBlockView: View {
         case 3:
             InlineMarkdownText(text)
                 .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.primary.opacity(0.95))
+                .foregroundStyle(.primary)
                 .padding(.top, 3)
         default:
             InlineMarkdownText(text)
@@ -726,7 +887,10 @@ private struct MarkdownBlockView: View {
 private struct MarkdownCodeBlockView: View {
     let language: String?
     let code: String
+    let isChinese: Bool
     @State private var copied = false
+    @State private var resetTask: Task<Void, Never>?
+    @State private var isHoveringCopy = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -741,49 +905,56 @@ private struct MarkdownCodeBlockView: View {
                     HStack(spacing: 3) {
                         Image(systemName: copied ? "checkmark" : "doc.on.doc")
                             .font(.system(size: 10))
-                        Text(copied ? "Copied" : "Copy")
+                        Text(copied ? (isChinese ? "已复制" : "Copied") : (isChinese ? "复制" : "Copy"))
                             .font(.system(size: 10, weight: .medium))
                     }
-                    .foregroundStyle(copied ? Color.green : Color.secondary)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 4))
+                    .foregroundStyle(copied ? Color.green : Color.primary.opacity(isHoveringCopy ? 0.95 : 0.72))
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2.5)
+                    .background(
+                        Color.primary.opacity(isHoveringCopy ? 0.12 : 0.06),
+                        in: RoundedRectangle(cornerRadius: 4)
+                    )
+                    .contentShape(RoundedRectangle(cornerRadius: 4))
                 }
                 .buttonStyle(.plain)
+                .onHover { isHoveringCopy = $0 }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
-            .background(Color.primary.opacity(0.04))
+            .background(Color(nsColor: .controlBackgroundColor).opacity(0.85))
 
-            Divider().opacity(0.5)
+            Divider().opacity(0.6)
 
             ScrollView(.horizontal, showsIndicators: true) {
                 Text(code)
                     .font(.system(size: 11.5, design: .monospaced))
-                    .foregroundStyle(.primary.opacity(0.92))
+                    .foregroundStyle(.primary.opacity(0.95))
                     .padding(10)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 8))
+        .background(Color(nsColor: .textBackgroundColor).opacity(0.92), in: RoundedRectangle(cornerRadius: 8))
         .overlay(
             RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(Color.primary.opacity(0.1), lineWidth: 0.75)
+                .strokeBorder(Color(nsColor: .separatorColor).opacity(0.55), lineWidth: 0.75)
         )
+        .onDisappear {
+            resetTask?.cancel()
+            resetTask = nil
+        }
     }
 
     private func copyToPasteboard() {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(code, forType: .string)
-        withAnimation(.easeInOut(duration: 0.15)) {
-            copied = true
-        }
-        Task { @MainActor in
+        resetTask?.cancel()
+        copied = true
+        resetTask = Task { @MainActor in
             try? await Task.sleep(for: .seconds(1.5))
-            withAnimation(.easeInOut(duration: 0.15)) {
-                copied = false
-            }
+            guard !Task.isCancelled else { return }
+            copied = false
         }
     }
 }
@@ -807,7 +978,7 @@ private struct MarkdownTableView: View {
                             .padding(.horizontal, 10)
                             .padding(.vertical, 6)
                             .frame(minWidth: 72, maxWidth: .infinity, alignment: alignment(for: col).swiftUIAlignment)
-                            .background(Color.primary.opacity(0.06))
+                            .background(Color(nsColor: .controlBackgroundColor).opacity(0.92))
                     }
                 }
 
@@ -819,17 +990,21 @@ private struct MarkdownTableView: View {
                         ForEach(Array(row.enumerated()), id: \.offset) { col, cell in
                             InlineMarkdownText(cell)
                                 .font(.system(size: 11.5))
-                                .foregroundStyle(.primary.opacity(0.9))
+                                .foregroundStyle(.primary.opacity(0.94))
                                 .multilineTextAlignment(alignment(for: col).textAlignment)
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 5)
                                 .frame(minWidth: 72, maxWidth: .infinity, alignment: alignment(for: col).swiftUIAlignment)
-                                .background(rowIdx.isMultiple(of: 2) ? Color.clear : Color.primary.opacity(0.025))
+                                .background(
+                                    rowIdx.isMultiple(of: 2)
+                                        ? Color(nsColor: .textBackgroundColor).opacity(0.92)
+                                        : Color(nsColor: .controlBackgroundColor).opacity(0.55)
+                                )
                         }
                     }
                     if rowIdx < rows.count - 1 {
                         Divider()
-                            .opacity(0.5)
+                            .opacity(0.55)
                             .gridCellUnsizedAxes(.horizontal)
                     }
                 }
@@ -837,7 +1012,7 @@ private struct MarkdownTableView: View {
             .clipShape(RoundedRectangle(cornerRadius: 7))
             .overlay(
                 RoundedRectangle(cornerRadius: 7)
-                    .strokeBorder(Color.primary.opacity(0.1), lineWidth: 0.75)
+                    .strokeBorder(Color(nsColor: .separatorColor).opacity(0.6), lineWidth: 0.75)
             )
         }
     }
@@ -847,25 +1022,20 @@ private struct MarkdownTableView: View {
     }
 }
 
-// MARK: - Inline Markdown Text
+// MARK: - Inline Markdown Text (Cached + CJK Bold Safe)
 
-struct InlineMarkdownText: View {
+struct InlineMarkdownText: View, Equatable {
     let raw: String
 
     init(_ raw: String) {
         self.raw = raw
     }
 
+    nonisolated static func == (lhs: InlineMarkdownText, rhs: InlineMarkdownText) -> Bool {
+        lhs.raw == rhs.raw
+    }
+
     var body: some View {
-        if let attributed = try? AttributedString(
-            markdown: raw,
-            options: AttributedString.MarkdownParsingOptions(
-                interpretedSyntax: .inlineOnlyPreservingWhitespace
-            )
-        ) {
-            Text(attributed)
-        } else {
-            Text(raw)
-        }
+        Text(InlineMarkdownCache.attributedString(for: raw))
     }
 }

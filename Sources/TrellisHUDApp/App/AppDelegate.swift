@@ -6,8 +6,8 @@ import UserNotifications
 
 /// Main macOS application delegate:
 /// - Runs as `.accessory` (no Dock icon)
-/// - Owns `HUDStore`, `HUDPanelController`, `FSEventsWatcher`, `UnixSocketServer`, optional `NSStatusItem`
-/// - Registers Carbon global hotkeys `⌘⇧T` (toggle workbench) and `⌘⇧M` (switch Notch ↔ Edge Pill)
+/// - Owns `HUDStore`, `HUDPanelController`, `FSEventsWatcher`, `HUDUnixSocketServer`, optional `NSStatusItem`
+/// - Registers Carbon global hotkeys `⌘⌥T` (toggle workbench) and `⌘⌥M` (switch Notch ↔ Edge Pill)
 /// - Emits native `UNUserNotificationCenter` alerts when an agent requires attention (bundle-guarded)
 @MainActor
 public final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -51,12 +51,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         requestNotificationAuthorizationIfBundled()
         startStalePruneTimer()
 
+        store.refreshHookStatuses()
         store.refreshAll()
     }
 
     public func applicationWillTerminate(_ notification: Notification) {
         stalePruneTimer?.invalidate()
         stalePruneTimer = nil
+        panelController?.teardown()
         fsWatcher?.stop()
         socketServer?.stop()
         unregisterGlobalHotKeys()
@@ -74,6 +76,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        store.onLanguageChanged = { [weak self] _ in
+            guard let self, self.statusItem != nil else { return }
+            self.rebuildStatusMenu()
+        }
+
         store.onWatchedPathsChanged = { [weak self] paths in
             self?.fsWatcher?.updatePaths(paths)
         }
@@ -83,10 +90,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         store.onJumpToTerminal = { [weak self] agent, projectPath in
+            guard let self else { return }
             if let appName = TerminalJumper.jump(agent: agent, projectPath: projectPath) {
-                self?.store.showToast("Switched to \(appName)")
+                self.store.showToast(self.store.l10n.t("Switched to \(appName)", "已切换到 \(appName)"))
             } else {
-                self?.store.showToast("No matching terminal or IDE running", isError: true)
+                self.store.showToast(
+                    self.store.l10n.t("No matching terminal or IDE running", "未找到运行中的终端或 IDE"),
+                    isError: true
+                )
             }
         }
     }
@@ -142,30 +153,37 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             button.image?.isTemplate = true
         }
+        self.statusItem = item
+        rebuildStatusMenu()
+    }
 
+    private func rebuildStatusMenu() {
+        guard let item = statusItem else { return }
+        let loc = store.l10n
         let menu = NSMenu()
+
         let toggleItem = NSMenuItem(
-            title: "Show / Hide Workbench",
+            title: loc.t("Show / Hide Workbench", "显示 / 隐藏工作台"),
             action: #selector(menuToggleWorkbench),
             keyEquivalent: "t"
         )
-        toggleItem.keyEquivalentModifierMask = [.command, .shift]
+        toggleItem.keyEquivalentModifierMask = [.command, .option]
         toggleItem.target = self
         menu.addItem(toggleItem)
 
         let modeItem = NSMenuItem(
-            title: "Switch Notch / Edge Pill",
+            title: loc.t("Switch Notch / Edge Pill", "切换刘海 / 吸边胶囊"),
             action: #selector(menuSwitchMode),
             keyEquivalent: "m"
         )
-        modeItem.keyEquivalentModifierMask = [.command, .shift]
+        modeItem.keyEquivalentModifierMask = [.command, .option]
         modeItem.target = self
         menu.addItem(modeItem)
 
         menu.addItem(.separator())
 
         let refreshItem = NSMenuItem(
-            title: "Refresh",
+            title: loc.t("Refresh", "刷新"),
             action: #selector(menuRefresh),
             keyEquivalent: "r"
         )
@@ -175,7 +193,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
 
         let quitItem = NSMenuItem(
-            title: "Quit Trellis HUD",
+            title: loc.t("Quit Trellis HUD", "退出 Trellis HUD"),
             action: #selector(menuQuit),
             keyEquivalent: "q"
         )
@@ -183,7 +201,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(quitItem)
 
         item.menu = menu
-        self.statusItem = item
     }
 
     private func removeStatusItem() {
@@ -209,7 +226,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.terminate(nil)
     }
 
-    // MARK: Carbon Global Hotkeys (`⌘⇧T` and `⌘⇧M`, no Accessibility permission required)
+    // MARK: Carbon Global Hotkeys (`⌘⌥T` and `⌘⌥M`, avoiding browser/IDE `⌘⇧T` Reopen Tab conflict)
 
     private func registerGlobalHotKeys() {
         var eventSpec = EventTypeSpec(
@@ -238,7 +255,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             return noErr
         }
 
-        InstallEventHandler(
+        let installStatus = InstallEventHandler(
             GetApplicationEventTarget(),
             callback,
             1,
@@ -246,23 +263,44 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             nil,
             &hotKeyHandlerRef
         )
-
-        let modifiers = UInt32(cmdKey | shiftKey)
-
-        // ⌘⇧T -> Toggle Workbench (kVK_ANSI_T = 17)
-        var toggleRef: EventHotKeyRef?
-        let toggleID = EventHotKeyID(signature: Self.hotKeySignature, id: Self.hotKeyToggleID)
-        if RegisterEventHotKey(UInt32(kVK_ANSI_T), modifiers, toggleID, GetApplicationEventTarget(), 0, &toggleRef) == noErr,
-           let toggleRef {
-            hotKeyRefs.append(toggleRef)
+        if installStatus != noErr {
+            fputs("[TrellisHUD] InstallEventHandler failed with OSStatus \(installStatus)\n", stderr)
         }
 
-        // ⌘⇧M -> Switch Notch / Edge Pill (kVK_ANSI_M = 46)
+        let modifiers = UInt32(cmdKey | optionKey)
+
+        // ⌘⌥T -> Toggle Workbench (kVK_ANSI_T = 17)
+        var toggleRef: EventHotKeyRef?
+        let toggleID = EventHotKeyID(signature: Self.hotKeySignature, id: Self.hotKeyToggleID)
+        let toggleStatus = RegisterEventHotKey(
+            UInt32(kVK_ANSI_T),
+            modifiers,
+            toggleID,
+            GetApplicationEventTarget(),
+            0,
+            &toggleRef
+        )
+        if toggleStatus == noErr, let toggleRef {
+            hotKeyRefs.append(toggleRef)
+        } else {
+            fputs("[TrellisHUD] RegisterEventHotKey (⌘⌥T) failed with OSStatus \(toggleStatus)\n", stderr)
+        }
+
+        // ⌘⌥M -> Switch Notch / Edge Pill (kVK_ANSI_M = 46)
         var modeRef: EventHotKeyRef?
         let modeID = EventHotKeyID(signature: Self.hotKeySignature, id: Self.hotKeyModeID)
-        if RegisterEventHotKey(UInt32(kVK_ANSI_M), modifiers, modeID, GetApplicationEventTarget(), 0, &modeRef) == noErr,
-           let modeRef {
+        let modeStatus = RegisterEventHotKey(
+            UInt32(kVK_ANSI_M),
+            modifiers,
+            modeID,
+            GetApplicationEventTarget(),
+            0,
+            &modeRef
+        )
+        if modeStatus == noErr, let modeRef {
             hotKeyRefs.append(modeRef)
+        } else {
+            fputs("[TrellisHUD] RegisterEventHotKey (⌘⌥M) failed with OSStatus \(modeStatus)\n", stderr)
         }
     }
 
@@ -299,15 +337,20 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func requestNotificationAuthorizationIfBundled() {
         guard canUseUserNotifications else { return }
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, error in
+            if let error {
+                fputs("[TrellisHUD] notification authorization error: \(error.localizedDescription)\n", stderr)
+            }
+        }
     }
 
     private func postAttentionNotification(for session: AgentSessionState) {
         guard canUseUserNotifications else { return }
+        let loc = store.l10n
         let content = UNMutableNotificationContent()
-        content.title = "\(session.agent.displayName) · \(session.status.label)"
+        content.title = "\(session.agent.displayName) · \(loc.statusLabel(session.status))"
         let projectName = URL(fileURLWithPath: session.projectPath).lastPathComponent
-        let detail = session.activity ?? session.toolName ?? "Requires your attention"
+        let detail = session.activity ?? session.toolName ?? loc.t("Requires your attention", "需要你的确认或介入")
         content.body = "\(projectName): \(detail)"
         content.sound = .default
 
@@ -316,6 +359,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             content: content,
             trigger: nil
         )
-        UNUserNotificationCenter.current().add(request) { _ in }
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error {
+                fputs("[TrellisHUD] notification delivery error: \(error.localizedDescription)\n", stderr)
+            }
+        }
     }
 }

@@ -23,10 +23,7 @@ let package = Package(
     targets: [
         .target(
             name: "TrellisCore",
-            path: "Sources/TrellisCore",
-            resources: [
-                .copy("Templates"),
-            ]
+            path: "Sources/TrellisCore"
         ),
         .executableTarget(
             name: "TrellisHookCLI",

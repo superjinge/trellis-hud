@@ -58,23 +58,35 @@ public enum MarkdownChecklistParser: Sendable {
     }
 
     /// Parses combined execution & acceptance checklists from `implement.md` and `prd.md` inside `taskDir`.
-    public static func parseTaskChecklists(taskDir: String) -> [ChecklistItem] {
+    /// When `preloadedPrdContent` is provided, avoids re-reading `prd.md` from disk.
+    public static func parseTaskChecklists(
+        taskDir: String,
+        preloadedPrdContent: String? = nil
+    ) -> [ChecklistItem] {
         let baseURL = URL(fileURLWithPath: taskDir, isDirectory: true)
         var combined: [ChecklistItem] = []
 
-        for fileName in ["implement.md", "prd.md"] {
-            let fileURL = baseURL.appendingPathComponent(fileName)
-            guard let content = try? String(contentsOf: fileURL, encoding: .utf8) else {
-                continue
-            }
-            combined.append(contentsOf: parseChecklists(markdown: content, sourceFile: fileName))
+        let implURL = baseURL.appendingPathComponent("implement.md")
+        if let implContent = try? String(contentsOf: implURL, encoding: .utf8) {
+            combined.append(contentsOf: parseChecklists(markdown: implContent, sourceFile: "implement.md"))
+        }
+
+        let prdContent: String?
+        if let preloadedPrdContent {
+            prdContent = preloadedPrdContent.isEmpty ? nil : preloadedPrdContent
+        } else {
+            let prdURL = baseURL.appendingPathComponent("prd.md")
+            prdContent = try? String(contentsOf: prdURL, encoding: .utf8)
+        }
+        if let prdContent {
+            combined.append(contentsOf: parseChecklists(markdown: prdContent, sourceFile: "prd.md"))
         }
 
         return combined
     }
 
     /// Extracts `paths:` glob patterns from YAML frontmatter of a Trellis spec Markdown document.
-    /// Supports both inline flow arrays (`paths: [a, b]`) and block lists (`- glob`).
+    /// Supports both inline flow arrays (`paths: [src/**/*.{ts,tsx}, foo/*.ts]`) and block lists (`- glob`).
     public static func extractFrontmatterPaths(markdown: String) -> [String] {
         let lines = markdown.components(separatedBy: .newlines)
         guard let first = lines.first?.trimmingCharacters(in: .whitespaces), first == "---" else {
@@ -100,11 +112,12 @@ public enum MarkdownChecklistParser: Sendable {
             }
 
             if trimmed.hasPrefix("paths:") {
-                let rest = String(trimmed.dropFirst("paths:".count)).trimmingCharacters(in: .whitespaces)
+                let rest = stripInlineYAMLComment(String(trimmed.dropFirst("paths:".count)))
+                    .trimmingCharacters(in: .whitespaces)
                 if rest.hasPrefix("[") && rest.hasSuffix("]") {
                     let inner = String(rest.dropFirst().dropLast())
-                    for item in inner.split(separator: ",") {
-                        appendPath(String(item))
+                    for item in splitYAMLFlowItems(inner) {
+                        appendPath(item)
                     }
                     inPaths = false
                 } else if !rest.isEmpty && !rest.hasPrefix("#") {
@@ -124,8 +137,6 @@ public enum MarkdownChecklistParser: Sendable {
                     let value = String(trimmed.dropFirst(2))
                     let withoutComment = stripInlineYAMLComment(value)
                     appendPath(withoutComment)
-                } else if !line.hasPrefix(" ") && !line.hasPrefix("\t") {
-                    inPaths = false
                 } else {
                     inPaths = false
                 }
@@ -210,6 +221,46 @@ public enum MarkdownChecklistParser: Sendable {
 
     // MARK: - Private Helpers
 
+    /// Splits a YAML flow array body on top-level commas only, preserving commas inside
+    /// `{a,b}` brace glob expressions and single/double-quoted strings.
+    private static func splitYAMLFlowItems(_ inner: String) -> [String] {
+        var items: [String] = []
+        var current = ""
+        var braceDepth = 0
+        var inSingle = false
+        var inDouble = false
+
+        for ch in inner {
+            if ch == "'" && !inDouble {
+                inSingle.toggle()
+                current.append(ch)
+            } else if ch == "\"" && !inSingle {
+                inDouble.toggle()
+                current.append(ch)
+            } else if !inSingle && !inDouble {
+                if ch == "{" {
+                    braceDepth += 1
+                    current.append(ch)
+                } else if ch == "}" {
+                    braceDepth = max(0, braceDepth - 1)
+                    current.append(ch)
+                } else if ch == "," && braceDepth == 0 {
+                    items.append(current)
+                    current = ""
+                } else {
+                    current.append(ch)
+                }
+            } else {
+                current.append(ch)
+            }
+        }
+
+        if !current.isEmpty {
+            items.append(current)
+        }
+        return items
+    }
+
     private static func fenceCharacter(for trimmedLine: String) -> Character? {
         if trimmedLine.hasPrefix("```") { return "`" }
         if trimmedLine.hasPrefix("~~~") { return "~" }
@@ -274,7 +325,6 @@ public enum MarkdownChecklistParser: Sendable {
                 return (rest, true)
             }
         }
-        // Ordered list: `1. text`
         var digits = 0
         for ch in line {
             if ch.isASCII && ch.isNumber { digits += 1 } else { break }

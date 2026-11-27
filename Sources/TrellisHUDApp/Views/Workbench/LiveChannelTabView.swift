@@ -6,10 +6,12 @@ struct LiveChannelTabView: View {
     @State private var selectedThreadFilter: String?
 
     var body: some View {
+        let l10n = store.l10n
+
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
-                attentionInboxSection
-                channelMonitorSection
+                attentionInboxSection(l10n: l10n)
+                channelMonitorSection(l10n: l10n)
             }
             .padding(14)
         }
@@ -17,7 +19,7 @@ struct LiveChannelTabView: View {
 
     // MARK: - Top Section: Multi-Agent Attention Inbox
 
-    private var attentionInboxSection: some View {
+    private func attentionInboxSection(l10n: L10n) -> some View {
         let attention = store.activeSessions.filter { $0.status.isAttentionRequired }
         let working = store.activeSessions.filter { $0.status == .working }
         let idleOrDone = store.activeSessions.filter {
@@ -25,17 +27,25 @@ struct LiveChannelTabView: View {
         }
 
         return WorkbenchCard(
-            title: "Multi-Agent Attention Inbox",
+            title: l10n.t("Multi-Agent Attention Inbox", "多 Agent 关注收件箱"),
             systemImage: "bell.badge.waveform"
         ) {
             HStack(spacing: 6) {
                 if !attention.isEmpty {
-                    StatusPill(text: "\(attention.count) Waiting", color: .orange, systemImage: "exclamationmark.circle.fill")
+                    StatusPill(
+                        text: l10n.t("\(attention.count) Waiting", "\(attention.count) 待处理"),
+                        color: .orange,
+                        systemImage: "exclamationmark.circle.fill"
+                    )
                 }
                 if !working.isEmpty {
-                    StatusPill(text: "\(working.count) Working", color: .blue, systemImage: "bolt.fill")
+                    StatusPill(
+                        text: l10n.t("\(working.count) Working", "\(working.count) 运行中"),
+                        color: .blue,
+                        systemImage: "bolt.fill"
+                    )
                 }
-                Text("\(store.activeSessions.count) total")
+                Text(l10n.t("\(store.activeSessions.count) total", "共 \(store.activeSessions.count) 个"))
                     .font(.system(size: 10.5, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
@@ -44,10 +54,13 @@ struct LiveChannelTabView: View {
                 VStack(spacing: 8) {
                     EmptyStatePlaceholder(
                         systemImage: "waveform.path.ecg",
-                        title: "No Active Agent Sessions",
-                        subtitle: "Install agent hooks in Settings to monitor Claude Code, Codex, Cursor, Pi, OpenCode, and DeepSeek Harness live."
+                        title: l10n.t("No Active Agent Sessions", "暂无活跃 Agent 会话"),
+                        subtitle: l10n.t(
+                            "Install agent hooks in Settings to monitor Claude Code, Codex, Cursor, Pi, OpenCode, and DeepSeek Harness live.",
+                            "在设置中一键安装 Agent Hook，即可实时监控 Claude Code、Codex、Cursor、Pi、OpenCode 与 DeepSeek Harness。"
+                        )
                     )
-                    Button("Configure Agent Hooks…") {
+                    Button(l10n.t("Configure Agent Hooks…", "配置 Agent Hook…")) {
                         store.isSettingsOpen = true
                     }
                     .buttonStyle(.bordered)
@@ -56,23 +69,23 @@ struct LiveChannelTabView: View {
             } else {
                 VStack(alignment: .leading, spacing: 10) {
                     if !attention.isEmpty {
-                        sessionGroupHeader("Waiting on You & Failed", count: attention.count, color: .orange)
+                        sessionGroupHeader(l10n.t("Waiting on You & Failed", "等待你的操作 / 失败"), count: attention.count, color: .orange)
                         ForEach(attention) { session in
-                            sessionRow(session, highlightAttention: true)
+                            sessionRow(session, highlightAttention: true, l10n: l10n)
                         }
                     }
 
                     if !working.isEmpty {
-                        sessionGroupHeader("Working", count: working.count, color: .blue)
+                        sessionGroupHeader(l10n.t("Working", "运行中"), count: working.count, color: .blue)
                         ForEach(working) { session in
-                            sessionRow(session, highlightAttention: false)
+                            sessionRow(session, highlightAttention: false, l10n: l10n)
                         }
                     }
 
                     if !idleOrDone.isEmpty {
-                        sessionGroupHeader("Idle & Recent", count: idleOrDone.count, color: .secondary)
+                        sessionGroupHeader(l10n.t("Idle & Recent", "空闲与近期"), count: idleOrDone.count, color: .secondary)
                         ForEach(idleOrDone) { session in
-                            sessionRow(session, highlightAttention: false)
+                            sessionRow(session, highlightAttention: false, l10n: l10n)
                         }
                     }
                 }
@@ -88,11 +101,11 @@ struct LiveChannelTabView: View {
                 .textCase(.uppercase)
             Text("· \(count)")
                 .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.secondary)
         }
     }
 
-    private func sessionRow(_ session: AgentSessionState, highlightAttention: Bool) -> some View {
+    private func sessionRow(_ session: AgentSessionState, highlightAttention: Bool, l10n: L10n) -> some View {
         let statusColor = HUDVisuals.color(for: session.status)
         let projectName = URL(fileURLWithPath: session.projectPath).lastPathComponent
         let detail = session.activity?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
@@ -111,7 +124,7 @@ struct LiveChannelTabView: View {
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(.primary)
 
-                    StatusPill(text: session.status.label, color: statusColor)
+                    StatusPill(text: l10n.statusLabel(session.status), color: statusColor)
 
                     Text(projectName)
                         .font(.system(size: 10.5, design: .monospaced))
@@ -121,7 +134,7 @@ struct LiveChannelTabView: View {
                     if let taskId = session.taskId, !taskId.isEmpty {
                         Text("/ \(taskId)")
                             .font(.system(size: 10.5, design: .monospaced))
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
                 }
@@ -130,13 +143,13 @@ struct LiveChannelTabView: View {
                     if let tool = session.toolName, !tool.isEmpty {
                         Text(tool)
                             .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(.primary.opacity(0.85))
+                            .foregroundStyle(.primary.opacity(0.9))
                             .padding(.horizontal, 4.5)
                             .padding(.vertical, 1)
-                            .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 3.5))
+                            .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 3.5))
                     }
 
-                    Text(detail.isEmpty ? "Active session" : detail)
+                    Text(detail.isEmpty ? l10n.t("Active session", "活跃会话") : detail)
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -146,14 +159,14 @@ struct LiveChannelTabView: View {
 
             Spacer(minLength: 6)
 
-            Text(HUDVisuals.relativeTime(session.updatedAt))
+            Text(HUDVisuals.relativeTime(session.updatedAt, l10n: l10n))
                 .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.secondary)
 
             Button {
                 store.jumpToSession(session)
             } label: {
-                Label("Jump", systemImage: "arrow.up.forward.app")
+                Label(l10n.t("Jump", "跳转"), systemImage: "arrow.up.forward.app")
                     .font(.system(size: 11, weight: .medium))
             }
             .buttonStyle(.bordered)
@@ -163,13 +176,13 @@ struct LiveChannelTabView: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         .background(
-            highlightAttention ? statusColor.opacity(0.1) : Color.primary.opacity(0.03),
+            highlightAttention ? statusColor.opacity(0.13) : Color(nsColor: .textBackgroundColor).opacity(0.65),
             in: RoundedRectangle(cornerRadius: 8, style: .continuous)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .strokeBorder(
-                    highlightAttention ? statusColor.opacity(0.32) : Color.primary.opacity(0.06),
+                    highlightAttention ? statusColor.opacity(0.4) : Color(nsColor: .separatorColor).opacity(0.45),
                     lineWidth: 0.75
                 )
         )
@@ -177,14 +190,14 @@ struct LiveChannelTabView: View {
 
     // MARK: - Bottom Section: Live Trellis Channel Monitor
 
-    private var channelMonitorSection: some View {
+    private func channelMonitorSection(l10n: L10n) -> some View {
         WorkbenchCard(
-            title: "Trellis Channel Monitor",
+            title: l10n.t("Trellis Channel Monitor", "Trellis Channel 实时监控"),
             systemImage: "bubble.left.and.bubble.right"
         ) {
             HStack(spacing: 8) {
                 if !store.channels.isEmpty {
-                    channelSelectorMenu
+                    channelSelectorMenu(l10n: l10n)
                 }
                 Button {
                     store.refreshChannelsOnly()
@@ -192,24 +205,28 @@ struct LiveChannelTabView: View {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
+                        .frame(width: 22, height: 22)
                 }
-                .buttonStyle(.plain)
-                .help("Reload ~/.trellis/channels/")
+                .buttonStyle(InteractiveSurfaceButtonStyle(cornerRadius: 5))
+                .help(l10n.t("Reload ~/.trellis/channels/", "重新加载 ~/.trellis/channels/"))
             }
         } content: {
             if let channel = store.selectedChannel {
-                channelDetailView(channel)
+                channelDetailView(channel, l10n: l10n)
             } else {
                 EmptyStatePlaceholder(
                     systemImage: "antenna.radiowaves.left.and.right.slash",
-                    title: "No Active Trellis Channels",
-                    subtitle: "Multi-agent channel traffic from ~/.trellis/channels/**/events.jsonl will stream here automatically."
+                    title: l10n.t("No Active Trellis Channels", "暂无活跃 Trellis 频道"),
+                    subtitle: l10n.t(
+                        "Multi-agent channel traffic from ~/.trellis/channels/**/events.jsonl will stream here automatically.",
+                        "来自 ~/.trellis/channels/**/events.jsonl 的多 Agent 协作频道消息将自动实时展示在此。"
+                    )
                 )
             }
         }
     }
 
-    private var channelSelectorMenu: some View {
+    private func channelSelectorMenu(l10n: L10n) -> some View {
         Menu {
             ForEach(store.channels) { ch in
                 Button {
@@ -217,7 +234,7 @@ struct LiveChannelTabView: View {
                     store.selectChannel(ch.id)
                 } label: {
                     HStack {
-                        Text("\(ch.name) (\(ch.activeWorkers.count) active)")
+                        Text(l10n.t("\(ch.name) (\(ch.activeWorkers.count) active)", "\(ch.name) (\(ch.activeWorkers.count) 活跃)"))
                         if ch.id == store.selectedChannel?.id {
                             Image(systemName: "checkmark")
                         }
@@ -226,23 +243,23 @@ struct LiveChannelTabView: View {
             }
         } label: {
             HStack(spacing: 4) {
-                Text(store.selectedChannel?.name ?? "Channel")
+                Text(store.selectedChannel?.name ?? l10n.t("Channel", "频道"))
                     .font(.system(size: 11, weight: .semibold, design: .monospaced))
                 Image(systemName: "chevron.up.chevron.down")
                     .font(.system(size: 8.5))
             }
             .foregroundStyle(.primary)
             .padding(.horizontal, 7)
-            .padding(.vertical, 3)
-            .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+            .padding(.vertical, 3.5)
+            .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+            .contentShape(RoundedRectangle(cornerRadius: 6))
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
     }
 
-    private func channelDetailView(_ channel: ChannelInfo) -> some View {
+    private func channelDetailView(_ channel: ChannelInfo, l10n: L10n) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            // Channel metadata strip
             HStack(spacing: 6) {
                 StatusPill(text: channel.type.rawValue.uppercased(), color: .accentColor)
                 StatusPill(text: channel.scope.rawValue, color: .secondary)
@@ -252,38 +269,39 @@ struct LiveChannelTabView: View {
                 Spacer()
                 Text("seq #\(channel.lastSeq)")
                     .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.secondary)
             }
 
-            // Active & recent workers
             if !channel.workers.isEmpty {
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("Workers (\(channel.activeWorkers.count) active / \(channel.workers.count) total)")
-                        .font(.system(size: 10.5, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                        .textCase(.uppercase)
+                    Text(l10n.t(
+                        "Workers (\(channel.activeWorkers.count) active / \(channel.workers.count) total)",
+                        "Workers（活跃 \(channel.activeWorkers.count) / 共 \(channel.workers.count)）"
+                    ))
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
 
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 7) {
                             ForEach(channel.workers) { worker in
-                                workerChip(worker)
+                                workerChip(worker, l10n: l10n)
                             }
                         }
                     }
                 }
             }
 
-            // Threads filter strip (forum or threaded chat)
             if !channel.threads.isEmpty {
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("Threads (\(channel.threads.count))")
+                    Text(l10n.t("Threads (\(channel.threads.count))", "话题 (\(channel.threads.count))"))
                         .font(.system(size: 10.5, weight: .semibold))
                         .foregroundStyle(.secondary)
                         .textCase(.uppercase)
 
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 6) {
-                            threadPill(id: nil, title: "All", count: channel.recentMessages.count, status: nil)
+                            threadPill(id: nil, title: l10n.t("All", "全部"), count: channel.recentMessages.count, status: nil)
                             ForEach(channel.threads) { thread in
                                 threadPill(
                                     id: thread.thread,
@@ -297,22 +315,21 @@ struct LiveChannelTabView: View {
                 }
             }
 
-            // Live Message Stream
             let visibleMessages = channel.recentMessages.filter { msg in
                 guard let filter = selectedThreadFilter else { return true }
                 return msg.thread == filter
             }
 
             VStack(alignment: .leading, spacing: 5) {
-                Text("Messages (\(visibleMessages.count))")
+                Text(l10n.t("Messages (\(visibleMessages.count))", "消息 (\(visibleMessages.count))"))
                     .font(.system(size: 10.5, weight: .semibold))
                     .foregroundStyle(.secondary)
                     .textCase(.uppercase)
 
                 if visibleMessages.isEmpty {
-                    Text("No messages in this channel yet.")
+                    Text(l10n.t("No messages in this channel yet.", "该频道暂无消息。"))
                         .font(.system(size: 11.5))
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.secondary)
                         .padding(.vertical, 6)
                 } else {
                     VStack(alignment: .leading, spacing: 6) {
@@ -325,9 +342,11 @@ struct LiveChannelTabView: View {
         }
     }
 
-    private func workerChip(_ worker: ChannelWorkerState) -> some View {
+    private func workerChip(_ worker: ChannelWorkerState, l10n: L10n) -> some View {
         let lifeColor = HUDVisuals.color(for: worker.lifecycle)
-        let activityLabel = worker.activity == .midTurn ? "mid-turn" : "idle"
+        let activityLabel = worker.activity == .midTurn
+            ? l10n.t("mid-turn", "执行中")
+            : l10n.t("idle", "空闲")
         let activityColor: Color = worker.activity == .midTurn ? .blue : .secondary
 
         return VStack(alignment: .leading, spacing: 4) {
@@ -339,7 +358,7 @@ struct LiveChannelTabView: View {
                     .font(.system(size: 11, weight: .semibold, design: .monospaced))
                     .foregroundStyle(.primary)
                 if worker.pendingMessageCount > 0 {
-                    Text("\(worker.pendingMessageCount) queued")
+                    Text(l10n.t("\(worker.pendingMessageCount) queued", "\(worker.pendingMessageCount) 待处理"))
                         .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
                         .foregroundStyle(.orange)
                 }
@@ -353,7 +372,7 @@ struct LiveChannelTabView: View {
                 if let agent = worker.agent, !agent.isEmpty {
                     Text(agent)
                         .font(.system(size: 9.5, design: .monospaced))
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.secondary)
                 }
             }
 
@@ -367,10 +386,10 @@ struct LiveChannelTabView: View {
         }
         .padding(.horizontal, 9)
         .padding(.vertical, 6.5)
-        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .background(Color(nsColor: .textBackgroundColor).opacity(0.68), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .strokeBorder(lifeColor.opacity(0.24), lineWidth: 0.75)
+                .strokeBorder(lifeColor.opacity(0.35), lineWidth: 0.75)
         )
     }
 
@@ -382,6 +401,7 @@ struct LiveChannelTabView: View {
             HStack(spacing: 4) {
                 Text(title)
                     .font(.system(size: 11, weight: isSelected ? .semibold : .regular))
+                    .foregroundStyle(isSelected ? Color.primary : Color.secondary)
                     .lineLimit(1)
                 Text("\(count)")
                     .font(.system(size: 9.5, design: .monospaced))
@@ -389,21 +409,19 @@ struct LiveChannelTabView: View {
                 if let status, status != "open" {
                     Text("· \(status)")
                         .font(.system(size: 9.5))
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.secondary)
                 }
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(
-                isSelected ? Color.accentColor.opacity(0.16) : Color.primary.opacity(0.05),
-                in: Capsule()
-            )
-            .overlay(
-                Capsule()
-                    .strokeBorder(isSelected ? Color.accentColor.opacity(0.4) : Color.clear, lineWidth: 0.75)
-            )
+            .padding(.horizontal, 9)
+            .padding(.vertical, 4.5)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(InteractiveSurfaceButtonStyle(
+            isSelected: isSelected,
+            isCapsule: true,
+            baseFill: Color.primary.opacity(0.06),
+            selectedFill: Color.accentColor.opacity(0.18),
+            selectedBorder: Color.accentColor.opacity(0.45)
+        ))
     }
 
     private func channelMessageRow(_ msg: ChannelMessage) -> some View {
@@ -411,7 +429,7 @@ struct LiveChannelTabView: View {
             HStack(spacing: 6) {
                 Text("#\(msg.seq)")
                     .font(.system(size: 9.5, design: .monospaced))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.secondary)
                 Text(msg.by)
                     .font(.system(size: 11, weight: .semibold, design: .monospaced))
                     .foregroundStyle(.primary)
@@ -427,19 +445,23 @@ struct LiveChannelTabView: View {
                 Spacer()
                 Text(HUDVisuals.shortTime(msg.timestamp))
                     .font(.system(size: 9.5, design: .monospaced))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.secondary)
             }
 
             if !msg.text.isEmpty {
                 InlineMarkdownText(msg.text)
                     .font(.system(size: 11.5))
-                    .foregroundStyle(.primary.opacity(0.9))
+                    .foregroundStyle(.primary.opacity(0.94))
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(.horizontal, 9)
         .padding(.vertical, 6.5)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .background(Color(nsColor: .textBackgroundColor).opacity(0.68), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .strokeBorder(Color(nsColor: .separatorColor).opacity(0.38), lineWidth: 0.5)
+        )
     }
 }

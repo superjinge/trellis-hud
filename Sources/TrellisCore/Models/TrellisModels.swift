@@ -463,6 +463,11 @@ public struct TaskSnapshot: Sendable, Codable, Equatable, Identifiable, Hashable
         archived || record.status == "completed" || record.status == "done"
     }
 
+    public var taskDirectoryPath: String {
+        let joined = (projectPath as NSString).appendingPathComponent(".trellis/tasks/\(dir)")
+        return ConfigStore.normalizePath(joined)
+    }
+
     public init(
         projectName: String,
         projectPath: String,
@@ -509,6 +514,12 @@ public enum EdgeAnchor: String, Sendable, Codable, Equatable, Hashable, CaseIter
     case bottomLeft
 }
 
+public enum AppLanguage: String, Sendable, Codable, Equatable, Hashable, CaseIterable {
+    case system
+    case zhHans = "zh-Hans"
+    case en
+}
+
 /// Compatible with `~/.config/trellis-card/config.json` plus new native HUD preferences.
 public struct HUDConfig: Sendable, Codable, Equatable {
     public var roots: [String]
@@ -523,6 +534,7 @@ public struct HUDConfig: Sendable, Codable, Equatable {
     public var showArchived: Bool
     public var selectedProjectPath: String?
     public var launchAtLogin: Bool
+    public var language: AppLanguage
 
     public init(
         roots: [String] = [],
@@ -536,7 +548,8 @@ public struct HUDConfig: Sendable, Codable, Equatable {
         autoFollowFocus: Bool = true,
         showArchived: Bool = false,
         selectedProjectPath: String? = nil,
-        launchAtLogin: Bool = false
+        launchAtLogin: Bool = false,
+        language: AppLanguage = .system
     ) {
         self.roots = roots
         self.dynamicProjects = dynamicProjects
@@ -550,6 +563,7 @@ public struct HUDConfig: Sendable, Codable, Equatable {
         self.showArchived = showArchived
         self.selectedProjectPath = selectedProjectPath
         self.launchAtLogin = launchAtLogin
+        self.language = language
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -565,6 +579,7 @@ public struct HUDConfig: Sendable, Codable, Equatable {
         case showArchived
         case selectedProjectPath
         case launchAtLogin
+        case language
     }
 
     public init(from decoder: any Decoder) throws {
@@ -581,5 +596,6 @@ public struct HUDConfig: Sendable, Codable, Equatable {
         self.showArchived = try c.decodeIfPresent(Bool.self, forKey: .showArchived) ?? false
         self.selectedProjectPath = try c.decodeIfPresent(String.self, forKey: .selectedProjectPath)
         self.launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? false
+        self.language = (try? c.decodeIfPresent(AppLanguage.self, forKey: .language)) ?? .system
     }
 }

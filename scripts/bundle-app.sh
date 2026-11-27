@@ -59,20 +59,19 @@ build_with_direct_swiftc() {
 
 echo "==> Building release binaries..."
 BUILD_LOG="$(mktemp)"
+trap 'rm -f "${BUILD_LOG:-}"' EXIT
 if swift build -c release >"$BUILD_LOG" 2>&1; then
     cat "$BUILD_LOG"
     BIN_DIR="$(swift build -c release --show-bin-path)"
 else
-    if grep -qE "swiftLanguageVersions|PackageDescription|Invalid manifest" "$BUILD_LOG"; then
-        echo "==> Detected host CLT PackageDescription manifest bug; switching to direct swiftc build."
+    if grep -qE "swiftLanguageVersions|PackageDescription|Invalid manifest|SwiftUIMacros|macro implementation" "$BUILD_LOG"; then
+        echo "==> Detected host CLT manifest/macro SDK bug; switching to direct swiftc build."
         build_with_direct_swiftc
     else
         cat "$BUILD_LOG" >&2
-        rm -f "$BUILD_LOG"
         exit 1
     fi
 fi
-rm -f "$BUILD_LOG"
 
 APP_DIR="$ROOT_DIR/build/TrellisHUD.app"
 CONTENTS_DIR="$APP_DIR/Contents"

@@ -20,17 +20,21 @@ public enum ProjectScanner: Sendable {
     // MARK: - Project Discovery
 
     /// Performs a breadth-first search under each root (up to `maxDepth`) to find Trellis projects
-    /// containing `.trellis/tasks/`. Continues descending inside discovered projects to find nested
-    /// monorepo sub-projects.
+    /// containing `.trellis/tasks/`. Deduplicates canonical directory paths to prevent symlink cycles
+    /// and continues descending inside discovered projects to find nested monorepo sub-projects.
     public static func discoverProjects(roots: [String], maxDepth: Int = 3) -> [ProjectInfo] {
         let fm = FileManager.default
-        var seenPaths = Set<String>()
+        var seenProjects = Set<String>()
+        var visitedDirs = Set<String>()
         var discovered: [ProjectInfo] = []
 
         for rawRoot in roots {
-            let rootPath = normalizePath(rawRoot)
+            let rootPath = ConfigStore.normalizePath(rawRoot)
             var isDir: ObjCBool = false
             guard fm.fileExists(atPath: rootPath, isDirectory: &isDir), isDir.boolValue else {
+                continue
+            }
+            guard visitedDirs.insert(rootPath).inserted else {
                 continue
             }
 
@@ -48,7 +52,7 @@ public enum ProjectScanner: Sendable {
                 let tasksDir = (current.path as NSString).appendingPathComponent(".trellis/tasks")
                 var tasksIsDir: ObjCBool = false
                 if fm.fileExists(atPath: tasksDir, isDirectory: &tasksIsDir), tasksIsDir.boolValue {
-                    if seenPaths.insert(current.path).inserted {
+                    if seenProjects.insert(current.path).inserted {
                         discovered.append(scanProjectInfo(projectPath: current.path))
                     }
                 }
@@ -62,12 +66,16 @@ public enum ProjectScanner: Sendable {
                     if entry.hasPrefix(".") || skippedDirectories.contains(entry) {
                         continue
                     }
-                    let childPath = (current.path as NSString).appendingPathComponent(entry)
+                    let rawChildPath = (current.path as NSString).appendingPathComponent(entry)
+                    let canonicalChild = ConfigStore.normalizePath(rawChildPath)
                     var childIsDir: ObjCBool = false
-                    guard fm.fileExists(atPath: childPath, isDirectory: &childIsDir), childIsDir.boolValue else {
+                    guard fm.fileExists(atPath: canonicalChild, isDirectory: &childIsDir), childIsDir.boolValue else {
                         continue
                     }
-                    queue.append((childPath, current.depth + 1))
+                    guard visitedDirs.insert(canonicalChild).inserted else {
+                        continue
+                    }
+                    queue.append((canonicalChild, current.depth + 1))
                 }
             }
         }
@@ -82,7 +90,7 @@ public enum ProjectScanner: Sendable {
 
     /// Computes summary metadata (`ProjectInfo`) for a single Trellis project directory.
     public static func scanProjectInfo(projectPath: String) -> ProjectInfo {
-        let normalized = normalizePath(projectPath)
+        let normalized = ConfigStore.normalizePath(projectPath)
         let active = scanActiveTasks(projectPath: normalized)
         let archivedCount = countArchivedTasks(projectPath: normalized)
         let lastActivity = active.map(\.mtime).max()
@@ -101,7 +109,7 @@ public enum ProjectScanner: Sendable {
 
     /// Scans all active (non-archived) tasks under `<projectPath>/.trellis/tasks/`.
     public static func scanActiveTasks(projectPath: String) -> [TaskSnapshot] {
-        let normalizedProject = normalizePath(projectPath)
+        let normalizedProject = ConfigStore.normalizePath(projectPath)
         let tasksDir = (normalizedProject as NSString).appendingPathComponent(".trellis/tasks")
         let fm = FileManager.default
 
@@ -147,7 +155,7 @@ public enum ProjectScanner: Sendable {
 
     /// Recursively scans archived tasks under `<projectPath>/.trellis/tasks/archive/`.
     public static func scanArchivedTasks(projectPath: String) -> [TaskSnapshot] {
-        let normalizedProject = normalizePath(projectPath)
+        let normalizedProject = ConfigStore.normalizePath(projectPath)
         let tasksDir = (normalizedProject as NSString).appendingPathComponent(".trellis/tasks")
         let archiveDir = (tasksDir as NSString).appendingPathComponent("archive")
         let fm = FileManager.default
@@ -181,7 +189,8 @@ public enum ProjectScanner: Sendable {
         }
     }
 
-    /// Safely loads a Markdown or text document inside `taskDir` with path-traversal protection.
+    /// Safely loads a Markdown or text document inside `taskDir` with full symlink-resolved
+    /// path-traversal protection (symlinks escaping `taskDir` are rejected).
     public static func loadTaskDocument(taskDir: String, relativePath: String) -> String? {
         let trimmed = relativePath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !trimmed.hasPrefix("/") else { return nil }
@@ -190,13 +199,22 @@ public enum ProjectScanner: Sendable {
         let components = normalizedRel.split(separator: "/").map(String.init)
         guard !components.contains(".."), !components.isEmpty else { return nil }
 
-        let baseURL = URL(fileURLWithPath: taskDir, isDirectory: true).standardizedFileURL
-        let targetURL = baseURL.appendingPathComponent(normalizedRel).standardizedFileURL
+        let rawBaseURL = URL(fileURLWithPath: taskDir, isDirectory: true)
+        let resolvedBaseURL = rawBaseURL.resolvingSymlinksInPath().standardizedFileURL
+        let rawTargetURL = resolvedBaseURL.appendingPathComponent(normalizedRel)
+        let resolvedTargetURL = rawTargetURL.resolvingSymlinksInPath().standardizedFileURL
 
-        let basePath = baseURL.path.hasSuffix("/") ? baseURL.path : baseURL.path + "/"
-        guard targetURL.path.hasPrefix(basePath) else { return nil }
+        let basePath = resolvedBaseURL.path.hasSuffix("/")
+            ? resolvedBaseURL.path
+            : resolvedBaseURL.path + "/"
+        guard resolvedTargetURL.path.hasPrefix(basePath) else { return nil }
 
-        guard let data = try? Data(contentsOf: targetURL) else { return nil }
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: resolvedTargetURL.path, isDirectory: &isDir),
+              !isDir.boolValue
+        else { return nil }
+
+        guard let data = try? Data(contentsOf: resolvedTargetURL) else { return nil }
         if data.count > maxDocumentBytes {
             let sliced = data.prefix(maxDocumentBytes)
             let text = String(decoding: sliced, as: UTF8.self)
@@ -208,7 +226,7 @@ public enum ProjectScanner: Sendable {
     /// Resolves the active Trellis task directory for a project by checking `.trellis/.runtime/sessions/*.json`
     /// and falling back to `.trellis/.current-task`.
     public static func resolveCurrentTaskDir(projectPath: String) -> String? {
-        let normalizedProject = normalizePath(projectPath)
+        let normalizedProject = ConfigStore.normalizePath(projectPath)
         let sessionsDir = (normalizedProject as NSString).appendingPathComponent(".trellis/.runtime/sessions")
         let fm = FileManager.default
 
@@ -335,14 +353,22 @@ public enum ProjectScanner: Sendable {
             configWorkflow: configWorkflow
         )
 
-        let artifacts = scanArtifacts(taskDir: fullTaskDir)
-        let checklist = MarkdownChecklistParser.parseTaskChecklists(taskDir: fullTaskDir)
-
+        // Read `prd.md` once per task and reuse across artifacts, checklists, excerpt, and cross-task refs.
         let prdPath = (fullTaskDir as NSString).appendingPathComponent("prd.md")
-        let prdContent = (try? String(contentsOfFile: prdPath, encoding: .utf8)) ?? ""
-        let excerpt = prdContent.isEmpty
-            ? record.description
-            : MarkdownChecklistParser.extractExcerpt(markdown: prdContent)
+        let prdContent = try? String(contentsOfFile: prdPath, encoding: .utf8)
+
+        let artifacts = scanArtifacts(taskDir: fullTaskDir, prdContent: prdContent)
+        let checklist = MarkdownChecklistParser.parseTaskChecklists(
+            taskDir: fullTaskDir,
+            preloadedPrdContent: prdContent ?? ""
+        )
+
+        let excerpt: String
+        if let prdContent, !prdContent.isEmpty {
+            excerpt = MarkdownChecklistParser.extractExcerpt(markdown: prdContent)
+        } else {
+            excerpt = record.description
+        }
 
         let (phase, phaseWarning) = inferWorkflowPhase(
             status: record.status,
@@ -378,9 +404,9 @@ public enum ProjectScanner: Sendable {
         )
     }
 
-    private static func scanArtifacts(taskDir: String) -> TaskArtifacts {
+    private static func scanArtifacts(taskDir: String, prdContent: String?) -> TaskArtifacts {
         let fm = FileManager.default
-        let hasPrd = fm.fileExists(atPath: (taskDir as NSString).appendingPathComponent("prd.md"))
+        let hasPrd = prdContent != nil || fm.fileExists(atPath: (taskDir as NSString).appendingPathComponent("prd.md"))
         let hasDesign = fm.fileExists(atPath: (taskDir as NSString).appendingPathComponent("design.md"))
         let hasImplement = fm.fileExists(atPath: (taskDir as NSString).appendingPathComponent("implement.md"))
 
@@ -428,7 +454,7 @@ public enum ProjectScanner: Sendable {
             fileRefs.append(ref)
         }
         let specRefs = fileRefs.filter(isSpecRef)
-        let prdRefs = collectPrdTaskRefs(taskDir: taskDir)
+        let prdRefs = prdContent.map(collectPrdTaskRefs(from:)) ?? []
 
         return TaskArtifacts(
             hasPrd: hasPrd,
@@ -483,9 +509,7 @@ public enum ProjectScanner: Sendable {
         return norm.hasPrefix(".trellis/spec/") || norm.hasPrefix("spec/") || norm.contains("/spec/")
     }
 
-    private static func collectPrdTaskRefs(taskDir: String) -> [String] {
-        let prdPath = (taskDir as NSString).appendingPathComponent("prd.md")
-        guard let content = try? String(contentsOfFile: prdPath, encoding: .utf8) else { return [] }
+    private static func collectPrdTaskRefs(from content: String) -> [String] {
         let marker = ".trellis/tasks/"
         let delimiters = CharacterSet(charactersIn: "/ `)\"'")
 
@@ -537,7 +561,6 @@ public enum ProjectScanner: Sendable {
             }
             return (.implement, nil)
         }
-        // Planning / default
         if !artifacts.hasPrd {
             return (.explore, nil)
         }
@@ -684,10 +707,5 @@ public enum ProjectScanner: Sendable {
             return String(target.dropFirst(b.count))
         }
         return URL(fileURLWithPath: target).lastPathComponent
-    }
-
-    private static func normalizePath(_ path: String) -> String {
-        let expanded = (path as NSString).expandingTildeInPath
-        return URL(fileURLWithPath: expanded).standardizedFileURL.path
     }
 }

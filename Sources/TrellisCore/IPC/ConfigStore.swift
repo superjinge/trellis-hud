@@ -73,7 +73,14 @@ public struct ConfigStore: Sendable {
         return path
     }
 
+    /// Non-throwing read for UI startup: falls back to `HUDConfig()` if absent or corrupt.
     public func load() -> HUDConfig {
+        (try? loadStrict()) ?? HUDConfig()
+    }
+
+    /// Strict read used before mutating writes so transient I/O errors or corrupt JSON
+    /// are never silently overwritten with empty defaults.
+    public func loadStrict() throws -> HUDConfig {
         let fm = FileManager.default
         let primary = configFileURL
         let fallback = fm.homeDirectoryForCurrentUser
@@ -88,11 +95,8 @@ public struct ConfigStore: Sendable {
             return HUDConfig()
         }
 
-        guard let data = try? Data(contentsOf: sourceURL),
-              let decoded = try? JSONDecoder().decode(HUDConfig.self, from: data) else {
-            return HUDConfig()
-        }
-        return decoded
+        let data = try Data(contentsOf: sourceURL)
+        return try JSONDecoder().decode(HUDConfig.self, from: data)
     }
 
     public func save(_ config: HUDConfig) throws {
@@ -101,18 +105,12 @@ public struct ConfigStore: Sendable {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(config)
-        let tempURL = configFileURL.appendingPathExtension("tmp")
-        try data.write(to: tempURL, options: .atomic)
-        if fm.fileExists(atPath: configFileURL.path) {
-            _ = try fm.replaceItemAt(configFileURL, withItemAt: tempURL)
-        } else {
-            try fm.moveItem(at: tempURL, to: configFileURL)
-        }
+        try data.write(to: configFileURL, options: .atomic)
     }
 
     @discardableResult
     public func addRoot(_ path: String) throws -> HUDConfig {
-        var config = load()
+        var config = try loadStrict()
         let normalized = Self.normalizePath(path)
         config.initialized = true
         if !config.roots.contains(where: { Self.normalizePath($0) == normalized }) {
@@ -124,7 +122,7 @@ public struct ConfigStore: Sendable {
 
     @discardableResult
     public func removeRoot(_ path: String) throws -> HUDConfig {
-        var config = load()
+        var config = try loadStrict()
         let normalized = Self.normalizePath(path)
         config.roots.removeAll { $0 == path || Self.normalizePath($0) == normalized }
         try save(config)
@@ -139,7 +137,7 @@ public struct ConfigStore: Sendable {
         guard FileManager.default.fileExists(atPath: tasksDir.path, isDirectory: &isDir), isDir.boolValue else {
             return false
         }
-        var config = load()
+        var config = try loadStrict()
         if config.dynamicProjects.contains(where: { Self.normalizePath($0) == normalized }) {
             return false
         }

@@ -66,6 +66,20 @@ public enum TrellisCoreTestRunner {
         try expect(legacy.subtasks[1].isCompleted == false, "Expected legacy subtask 1 pending")
     }
 
+    public static func testAppLanguageConfigTolerantDecode() throws {
+        let missingLangJSON = #"{"roots":["/tmp/a"],"initialized":true}"#
+        let decodedDefault = try JSONDecoder().decode(HUDConfig.self, from: Data(missingLangJSON.utf8))
+        try expect(decodedDefault.language == .system, "Missing language field should default to .system")
+
+        let zhJSON = #"{"language":"zh-Hans"}"#
+        let decodedZh = try JSONDecoder().decode(HUDConfig.self, from: Data(zhJSON.utf8))
+        try expect(decodedZh.language == .zhHans, "Expected .zhHans language")
+
+        let enJSON = #"{"language":"en"}"#
+        let decodedEn = try JSONDecoder().decode(HUDConfig.self, from: Data(enJSON.utf8))
+        try expect(decodedEn.language == .en, "Expected .en language")
+    }
+
     public static func testMarkdownChecklistParserHandlesSectionsCodeFencesAndACs() throws {
         let md = """
         # Implementation Plan
@@ -95,7 +109,7 @@ public enum TrellisCoreTestRunner {
         try expect(items[4].isCompleted == false, "Item 4 incomplete")
     }
 
-    public static func testFrontmatterPathExtractorParsesBlockAndFlowSyntax() throws {
+    public static func testFrontmatterPathExtractorParsesBlockFlowAndBraceGlobs() throws {
         let blockSpec = """
         ---
         name: cli-backend
@@ -113,18 +127,30 @@ public enum TrellisCoreTestRunner {
 
         let flowSpec = """
         ---
-        paths: [src/index.ts, 'test/*.test.js', "docs/**"]
+        paths: [src/**/*.{ts,tsx}, 'test/*.test.js', "docs/{api,guides}/**.md"]
         ---
         # Content
         """
+        let extracted = MarkdownChecklistParser.extractFrontmatterPaths(markdown: flowSpec)
         try expect(
-            MarkdownChecklistParser.extractFrontmatterPaths(markdown: flowSpec)
-                == ["src/index.ts", "test/*.test.js", "docs/**"],
-            "Flow frontmatter paths mismatch"
+            extracted == ["src/**/*.{ts,tsx}", "test/*.test.js", "docs/{api,guides}/**.md"],
+            "Brace glob flow frontmatter paths mismatch: \(extracted)"
+        )
+        try expect(
+            SpecAndGitAnalyzer.matchesGlob(pattern: "src/**/*.{ts,tsx}", path: "src/components/Button.tsx"),
+            "Brace glob should match .tsx"
+        )
+        try expect(
+            SpecAndGitAnalyzer.matchesGlob(pattern: "src/**/*.{ts,tsx}", path: "src/index.ts"),
+            "Brace glob should match .ts"
+        )
+        try expect(
+            !SpecAndGitAnalyzer.matchesGlob(pattern: "src/**/*.{ts,tsx}", path: "src/index.js"),
+            "Brace glob should not match .js"
         )
     }
 
-    public static func testProjectScannerDiscoversTasksAndComputesHonestProgress() throws {
+    public static func testProjectScannerDiscoversTasksSymlinkGuardAndTaskDirectoryPath() throws {
         let tmp = FileManager.default.temporaryDirectory
             .appendingPathComponent("trellis-hud-scan-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: tmp) }
@@ -133,10 +159,16 @@ public enum TrellisCoreTestRunner {
         let activeTask = repo.appendingPathComponent(".trellis/tasks/11-27-build-hud", isDirectory: true)
         let archivedTask = repo.appendingPathComponent(".trellis/tasks/archive/2026-11/11-01-old", isDirectory: true)
         let bootstrapTask = repo.appendingPathComponent(".trellis/tasks/00-bootstrap-guidelines", isDirectory: true)
+        let outsideSecret = tmp.appendingPathComponent("secret.txt")
 
         try FileManager.default.createDirectory(at: activeTask.appendingPathComponent("research"), withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: archivedTask, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: bootstrapTask, withIntermediateDirectories: true)
+        try "TOP_SECRET_DATA".write(to: outsideSecret, atomically: true, encoding: .utf8)
+
+        // Create a symlink inside activeTask pointing outside activeTask (must be blocked by loadTaskDocument).
+        let escapeSymlink = activeTask.appendingPathComponent("escape.md")
+        try FileManager.default.createSymbolicLink(at: escapeSymlink, withDestinationURL: outsideSecret)
 
         try """
         {"id":"build-hud","title":"Build HUD","status":"in_progress","priority":"P0","subtasks":["Phase A"]}
@@ -189,19 +221,29 @@ public enum TrellisCoreTestRunner {
         try expect(abs(task.progress - 0.6) < 0.001, "Expected 0.6 honest progress")
         try expect(task.artifacts.implContextCount == 1, "Expected 1 real impl context entry")
         try expect(task.excerpt.contains("Build a crisp native Swift HUD"), "Expected PRD excerpt")
+        try expect(
+            task.taskDirectoryPath == ConfigStore.normalizePath(activeTask.path),
+            "Active TaskSnapshot.taskDirectoryPath mismatch: \(task.taskDirectoryPath)"
+        )
 
+        // Safe document loader allows internal files and rejects traversal AND escaping symlinks
         try expect(ProjectScanner.loadTaskDocument(taskDir: activeTask.path, relativePath: "prd.md") != nil, "Load prd.md")
         try expect(ProjectScanner.loadTaskDocument(taskDir: activeTask.path, relativePath: "../task.json") == nil, "Reject .. traversal")
         try expect(ProjectScanner.loadTaskDocument(taskDir: activeTask.path, relativePath: "/etc/passwd") == nil, "Reject absolute path")
+        try expect(ProjectScanner.loadTaskDocument(taskDir: activeTask.path, relativePath: "escape.md") == nil, "Reject symlink escaping taskDir")
 
         let archived = ProjectScanner.scanArchivedTasks(projectPath: repo.path)
         try expect(archived.count == 1, "Expected 1 archived task")
         try expect(archived[0].archived == true, "Archived flag true")
         try expect(archived[0].phase == .archive, "Archived phase")
         try expect(archived[0].dir == "archive/2026-11/11-01-old", "Archived relative dir")
+        try expect(
+            archived[0].taskDirectoryPath == ConfigStore.normalizePath(archivedTask.path),
+            "Archived TaskSnapshot.taskDirectoryPath mismatch: \(archived[0].taskDirectoryPath)"
+        )
     }
 
-    public static func testSpecAnalyzerHandlesThreeLevelMonorepoAndGlobMatching() throws {
+    public static func testSpecAnalyzerHandlesThreeLevelMonorepoGlobAndCJKGitPaths() throws {
         let tmp = FileManager.default.temporaryDirectory
             .appendingPathComponent("trellis-hud-spec-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: tmp) }
@@ -264,23 +306,32 @@ public enum TrellisCoreTestRunner {
         try expect(emptySpec.layer == "frontend", "2-level spec should have layer frontend")
         try expect(emptySpec.isEmptyTemplate == true, "Placeholder spec should be empty template")
 
-        try expect(SpecAndGitAnalyzer.matchesGlob(pattern: "src/**/*.swift", path: "src/App.swift"), "** root match")
-        try expect(SpecAndGitAnalyzer.matchesGlob(pattern: "src/**/*.swift", path: "src/a/b/App.swift"), "** deep match")
-        try expect(!SpecAndGitAnalyzer.matchesGlob(pattern: "src/*.swift", path: "src/a/App.swift"), "* single-segment")
-        try expect(SpecAndGitAnalyzer.matchesGlob(pattern: "src/?.swift", path: "src/A.swift"), "? single-char")
+        // Verify CJK UTF-8 git paths are NOT octal-escaped (`-c core.quotepath=false`)
+        let initRes = SubprocessRunner.run(executable: "/usr/bin/git", arguments: ["init"], currentDirectory: tmp.path)
+        if initRes.succeeded {
+            let docsDir = tmp.appendingPathComponent("文档", isDirectory: true)
+            try FileManager.default.createDirectory(at: docsDir, withIntermediateDirectories: true)
+            try "中文测试".write(to: docsDir.appendingPathComponent("设计说明.md"), atomically: true, encoding: .utf8)
+            let status = SpecAndGitAnalyzer.captureGitStatus(projectPath: tmp.path)
+            let hasUnescapedCJK = status.modifiedPaths.contains { $0.contains("文档") }
+            try expect(hasUnescapedCJK, "Expected unescaped CJK path in git status, got \(status.modifiedPaths)")
+        }
     }
 
-    public static func testChannelReaderReducesWorkersThreadsAndPendingMessages() throws {
+    public static func testChannelReaderReducesWorkersThreadsBroadcastAndPendingMessages() throws {
         let jsonl = """
         {"seq":1,"ts":"2026-11-27T07:00:00Z","kind":"create","by":"main","type":"forum","description":"Review swarm","cwd":"/repo/demo","task":"11-27-demo"}
         {"seq":2,"ts":"2026-11-27T07:00:01Z","kind":"channel","by":"main","action":"title","title":"HUD Review"}
         {"seq":3,"ts":"2026-11-27T07:00:02Z","kind":"spawned","by":"main","as":"reviewer","provider":"codex","agent":"trellis-check","inboxPolicy":"explicitOnly"}
-        {"seq":4,"ts":"2026-11-27T07:00:03Z","kind":"message","by":"main","to":"reviewer","text":"Please audit Scanner"}
-        {"seq":5,"ts":"2026-11-27T07:00:04Z","kind":"turn_started","by":"supervisor:reviewer","worker":"reviewer","turnId":"t1","inputSeq":4}
-        {"seq":6,"ts":"2026-11-27T07:00:05Z","kind":"message","by":"main","to":"reviewer","text":"Also check glob matching"}
-        {"seq":7,"ts":"2026-11-27T07:00:06Z","kind":"thread","by":"main","action":"opened","thread":"t-old","title":"Glob edge cases","labels":["scanner"]}
-        {"seq":8,"ts":"2026-11-27T07:00:07Z","kind":"thread","by":"reviewer","action":"comment","thread":"t-old","text":"Looks solid!"}
-        {"seq":9,"ts":"2026-11-27T07:00:08Z","kind":"thread","by":"main","action":"rename","thread":"t-old","newThread":"t-glob"}
+        {"seq":4,"ts":"2026-11-27T07:00:02.500Z","kind":"spawned","by":"main","as":"watcher","provider":"claude","inboxPolicy":"broadcastAndExplicit"}
+        {"seq":5,"ts":"2026-11-27T07:00:03Z","kind":"message","by":"main","to":"reviewer","text":"Please audit Scanner"}
+        {"seq":6,"ts":"2026-11-27T07:00:04Z","kind":"turn_started","by":"supervisor:reviewer","worker":"reviewer","turnId":"t1","inputSeq":5}
+        {"seq":7,"ts":"2026-11-27T07:00:05Z","kind":"message","by":"main","to":"reviewer","text":"Also check glob matching"}
+        {"seq":8,"ts":"2026-11-27T07:00:05Z","kind":"message","by":"main","text":"Broadcast update for all"}
+        {"seq":9,"ts":"2026-11-27T07:00:05Z","kind":"message","by":"watcher","text":"Watcher self-broadcast must not count"}
+        {"seq":10,"ts":"2026-11-27T07:00:06Z","kind":"thread","by":"main","action":"opened","thread":"t-old","title":"Glob edge cases","labels":["scanner"]}
+        {"seq":11,"ts":"2026-11-27T07:00:07Z","kind":"thread","by":"reviewer","action":"comment","thread":"t-old","text":"Looks solid!"}
+        {"seq":12,"ts":"2026-11-27T07:00:08Z","kind":"thread","by":"main","action":"rename","thread":"t-old","newThread":"t-glob"}
         {corrupted json line should be skipped gracefully
         """
 
@@ -295,16 +346,25 @@ public enum TrellisCoreTestRunner {
         try expect(info.type == .forum, "Expected forum channel")
         try expect(info.title == "HUD Review", "Expected channel title")
         try expect(info.taskRef == "11-27-demo", "Expected taskRef")
-        try expect(info.lastSeq == 9, "Expected lastSeq 9")
-        try expect(info.workers.count == 1, "Expected 1 worker")
-        try expect(info.workers[0].lifecycle == .running, "Expected running worker")
-        try expect(info.workers[0].activity == .midTurn, "Expected midTurn worker")
-        try expect(info.workers[0].pendingMessageCount == 1, "Expected 1 pending message")
+        try expect(info.lastSeq == 12, "Expected lastSeq 12")
+        try expect(info.workers.count == 2, "Expected 2 workers")
+
+        guard let reviewer = info.workers.first(where: { $0.workerId == "reviewer" }),
+              let watcher = info.workers.first(where: { $0.workerId == "watcher" })
+        else {
+            throw Failure(message: "Missing expected workers")
+        }
+
+        try expect(reviewer.lifecycle == .running, "Expected running reviewer")
+        try expect(reviewer.activity == .midTurn, "Expected midTurn reviewer")
+        try expect(reviewer.pendingMessageCount == 1, "Expected 1 explicit pending message for reviewer, got \(reviewer.pendingMessageCount)")
+        try expect(watcher.pendingMessageCount == 1, "Expected 1 broadcast pending message for watcher (excluding self), got \(watcher.pendingMessageCount)")
+
         try expect(info.threads.count == 1, "Expected 1 thread")
         try expect(info.threads[0].thread == "t-glob", "Expected renamed thread key")
         try expect(info.threads[0].aliases == ["t-old"], "Expected alias t-old")
         try expect(info.threads[0].comments == 1, "Expected 1 comment")
-        try expect(info.recentMessages.count >= 3, "Expected >=3 recent messages")
+        try expect(info.recentMessages.count >= 4, "Expected >=4 recent messages")
     }
 
     public static func testMemoryReaderScansJournalsAndSearchesAntigravitySessions() throws {
@@ -335,7 +395,7 @@ public enum TrellisCoreTestRunner {
         let fakeHome = tmp.appendingPathComponent("home", isDirectory: true)
         let logDir = fakeHome.appendingPathComponent(".gemini/antigravity/brain/conv-123/.system_generated/logs", isDirectory: true)
         try FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
-        let repoPath = tmp.appendingPathComponent("repo").standardizedFileURL.path
+        let repoPath = ConfigStore.normalizePath(tmp.appendingPathComponent("repo").path)
         try """
         {"type":"USER_INPUT","created_at":"2026-11-27T07:00:00Z","cwd":"\(repoPath)","content":"<USER_REQUEST>Design the Trellis Swift HUD notch controller</USER_REQUEST>"}
         {"type":"PLANNER_RESPONSE","created_at":"2026-11-27T07:00:05Z","content":"Using NSPanel with safeAreaInsets for native notch alignment."}
@@ -354,14 +414,58 @@ public enum TrellisCoreTestRunner {
         try expect(found[0].matchCount >= 2, "Expected >=2 token matches")
     }
 
+    public static func testHookEventParserTimestampsAndArchiveSkip() throws {
+        // Archive path must not resolve "archive" as an active task id
+        try expect(
+            HookEventParser.extractTaskDir(from: "cat /repo/.trellis/tasks/archive/2026-11/old/prd.md") == nil,
+            "extractTaskDir must skip 'archive' segment"
+        )
+        try expect(
+            HookEventParser.extractTaskDir(from: "edit /repo/.trellis/tasks/11-27-live/prd.md") == "11-27-live",
+            "extractTaskDir should extract active task dir"
+        )
+
+        // Millisecond timestamp in hook payload should normalize to Unix seconds
+        let payload = """
+        {
+          "session_id": "s-ms",
+          "cwd": "/tmp/demo",
+          "event_name": "PreToolUse",
+          "tool_name": "Read",
+          "timestamp": 1732690000123
+        }
+        """
+        let event = try HookEventParser.parsePayload(
+            payload,
+            overrides: HookOverrides(agent: "claude")
+        )
+        try expect(event.timestamp == 1_732_690_000, "Expected ms timestamp normalized to seconds, got \(event.timestamp)")
+    }
+
+    public static func testSubprocessRunnerLargeOutputDoesNotDeadlock() throws {
+        // Emit >128 KB to stdout AND >128 KB to stderr simultaneously to prove pipe draining never deadlocks.
+        let result = SubprocessRunner.run(
+            executable: "/usr/bin/python3",
+            arguments: ["-c", "import sys; sys.stdout.write('A'*140000); sys.stderr.write('B'*140000)"],
+            timeoutSeconds: 5.0,
+            maxOutputBytes: 200_000
+        )
+        try expect(result.succeeded, "SubprocessRunner large output failed or timed out: timedOut=\(result.timedOut) code=\(result.exitCode)")
+        try expect(result.stdout.count == 140_000, "Expected 140000 stdout bytes, got \(result.stdout.count)")
+        try expect(result.stderr.count == 140_000, "Expected 140000 stderr bytes, got \(result.stderr.count)")
+    }
+
     public static func runAll() throws {
         try testTaskRecordDecodesCanonicalAndLegacySubtasks()
+        try testAppLanguageConfigTolerantDecode()
         try testMarkdownChecklistParserHandlesSectionsCodeFencesAndACs()
-        try testFrontmatterPathExtractorParsesBlockAndFlowSyntax()
-        try testProjectScannerDiscoversTasksAndComputesHonestProgress()
-        try testSpecAnalyzerHandlesThreeLevelMonorepoAndGlobMatching()
-        try testChannelReaderReducesWorkersThreadsAndPendingMessages()
+        try testFrontmatterPathExtractorParsesBlockFlowAndBraceGlobs()
+        try testProjectScannerDiscoversTasksSymlinkGuardAndTaskDirectoryPath()
+        try testSpecAnalyzerHandlesThreeLevelMonorepoGlobAndCJKGitPaths()
+        try testChannelReaderReducesWorkersThreadsBroadcastAndPendingMessages()
         try testMemoryReaderScansJournalsAndSearchesAntigravitySessions()
+        try testHookEventParserTimestampsAndArchiveSkip()
+        try testSubprocessRunnerLargeOutputDoesNotDeadlock()
     }
 }
 
@@ -370,27 +474,39 @@ public enum TrellisCoreTestRunner {
     try TrellisCoreTestRunner.testTaskRecordDecodesCanonicalAndLegacySubtasks()
 }
 
+@Test func appLanguageConfigTolerantDecode() throws {
+    try TrellisCoreTestRunner.testAppLanguageConfigTolerantDecode()
+}
+
 @Test func markdownChecklistParserHandlesSectionsCodeFencesAndACs() throws {
     try TrellisCoreTestRunner.testMarkdownChecklistParserHandlesSectionsCodeFencesAndACs()
 }
 
-@Test func frontmatterPathExtractorParsesBlockAndFlowSyntax() throws {
-    try TrellisCoreTestRunner.testFrontmatterPathExtractorParsesBlockAndFlowSyntax()
+@Test func frontmatterPathExtractorParsesBlockFlowAndBraceGlobs() throws {
+    try TrellisCoreTestRunner.testFrontmatterPathExtractorParsesBlockFlowAndBraceGlobs()
 }
 
-@Test func projectScannerDiscoversTasksAndComputesHonestProgress() throws {
-    try TrellisCoreTestRunner.testProjectScannerDiscoversTasksAndComputesHonestProgress()
+@Test func projectScannerDiscoversTasksSymlinkGuardAndTaskDirectoryPath() throws {
+    try TrellisCoreTestRunner.testProjectScannerDiscoversTasksSymlinkGuardAndTaskDirectoryPath()
 }
 
-@Test func specAnalyzerHandlesThreeLevelMonorepoAndGlobMatching() throws {
-    try TrellisCoreTestRunner.testSpecAnalyzerHandlesThreeLevelMonorepoAndGlobMatching()
+@Test func specAnalyzerHandlesThreeLevelMonorepoGlobAndCJKGitPaths() throws {
+    try TrellisCoreTestRunner.testSpecAnalyzerHandlesThreeLevelMonorepoGlobAndCJKGitPaths()
 }
 
-@Test func channelReaderReducesWorkersThreadsAndPendingMessages() throws {
-    try TrellisCoreTestRunner.testChannelReaderReducesWorkersThreadsAndPendingMessages()
+@Test func channelReaderReducesWorkersThreadsBroadcastAndPendingMessages() throws {
+    try TrellisCoreTestRunner.testChannelReaderReducesWorkersThreadsBroadcastAndPendingMessages()
 }
 
 @Test func memoryReaderScansJournalsAndSearchesAntigravitySessions() throws {
     try TrellisCoreTestRunner.testMemoryReaderScansJournalsAndSearchesAntigravitySessions()
+}
+
+@Test func hookEventParserTimestampsAndArchiveSkip() throws {
+    try TrellisCoreTestRunner.testHookEventParserTimestampsAndArchiveSkip()
+}
+
+@Test func subprocessRunnerLargeOutputDoesNotDeadlock() throws {
+    try TrellisCoreTestRunner.testSubprocessRunnerLargeOutputDoesNotDeadlock()
 }
 #endif

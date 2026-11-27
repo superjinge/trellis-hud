@@ -2,71 +2,77 @@ import SwiftUI
 import TrellisCore
 
 public struct WorkbenchContainerView: View {
-    @Bindable var store: HUDStore
+    let store: HUDStore
 
     public init(store: HUDStore) {
         self.store = store
     }
 
     public var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 16, style: .continuous)
+
         VStack(spacing: 0) {
-            topBar
-            Divider().opacity(0.5)
-            tabBar
-            Divider().opacity(0.45)
+            WorkbenchTopBarView(store: store)
+            Divider().opacity(0.6)
+            WorkbenchTabBarView(store: store)
+            Divider().opacity(0.55)
 
             ZStack(alignment: .bottom) {
-                tabContent
+                WorkbenchTabContentView(store: store)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-                if let toast = store.statusToast {
-                    toastBanner(toast)
-                        .padding(.horizontal, 14)
-                        .padding(.bottom, 12)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
-                }
+                WorkbenchToastOverlay(store: store)
             }
-            .animation(.spring(response: 0.28, dampingFraction: 0.86), value: store.statusToast)
         }
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .background {
+            ZStack {
+                shape.fill(.thickMaterial)
+                shape.fill(Color(nsColor: .windowBackgroundColor).opacity(0.88))
+            }
+        }
+        .clipShape(shape)
         .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.14), lineWidth: 0.75)
+            shape.strokeBorder(Color(nsColor: .separatorColor).opacity(0.65), lineWidth: 0.75)
         )
-        .shadow(color: Color.black.opacity(0.18), radius: 22, x: 0, y: 10)
+        .shadow(color: Color.black.opacity(0.24), radius: 22, x: 0, y: 10)
         .onExitCommand {
             store.collapse()
         }
     }
+}
 
-    // MARK: - Top Bar
+// MARK: - Isolated Top Bar (Prevents Toast / Tab Content Over-Invalidation)
 
-    private var topBar: some View {
+private struct WorkbenchTopBarView: View {
+    @Bindable var store: HUDStore
+
+    var body: some View {
+        let l10n = store.l10n
+
         HStack(spacing: 8) {
-            projectSelector
+            projectSelector(l10n: l10n)
             Image(systemName: "chevron.right")
                 .font(.system(size: 9, weight: .semibold))
-                .foregroundStyle(.tertiary)
-            taskSelector
+                .foregroundStyle(.secondary)
+            taskSelector(l10n: l10n)
 
             Spacer(minLength: 8)
 
-            modeToggleButton
-            refreshButton
-            settingsButton
-            collapseButton
+            modeToggleButton(l10n: l10n)
+            refreshButton(l10n: l10n)
+            settingsButton(l10n: l10n)
+            collapseButton(l10n: l10n)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
     }
 
-    private var projectSelector: some View {
+    private func projectSelector(l10n: L10n) -> some View {
         Menu {
             if store.projects.isEmpty {
-                Text("No .trellis projects discovered")
+                Text(l10n.t("No .trellis projects discovered", "未发现 .trellis 项目"))
                 Divider()
-                Button("Add Watched Folder…") {
+                Button(l10n.t("Add Watched Folder…", "添加监听目录…")) {
                     store.addRootFolderInteractive()
                 }
             } else {
@@ -86,7 +92,7 @@ public struct WorkbenchContainerView: View {
                     }
                 }
                 Divider()
-                Button("Add Watched Folder…") {
+                Button(l10n.t("Add Watched Folder…", "添加监听目录…")) {
                     store.addRootFolderInteractive()
                 }
             }
@@ -95,7 +101,7 @@ public struct WorkbenchContainerView: View {
                 Circle()
                     .fill(HUDVisuals.color(for: store.globalStatus))
                     .frame(width: 7, height: 7)
-                Text(store.selectedProject?.name ?? "No Project")
+                Text(store.selectedProject?.name ?? l10n.t("No Project", "未选项目"))
                     .font(.system(size: 12, weight: .semibold))
                     .lineLimit(1)
                 Image(systemName: "chevron.up.chevron.down")
@@ -104,17 +110,18 @@ public struct WorkbenchContainerView: View {
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 4.5)
-            .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
-        .help(store.selectedProject.map { HUDVisuals.abbreviateHome($0.path) } ?? "Select a Trellis project")
+        .help(store.selectedProject.map { HUDVisuals.abbreviateHome($0.path) } ?? l10n.t("Select a Trellis project", "选择 Trellis 项目"))
     }
 
-    private var taskSelector: some View {
+    private func taskSelector(l10n: L10n) -> some View {
         Menu {
             if store.activeTasks.isEmpty {
-                Text("No active tasks")
+                Text(l10n.t("No active tasks", "暂无进行中任务"))
             } else {
                 ForEach(store.activeTasks) { task in
                     Button {
@@ -122,7 +129,7 @@ public struct WorkbenchContainerView: View {
                     } label: {
                         let label = task.record.title.isEmpty ? task.dir : task.record.title
                         HStack {
-                            Text("\(label) · \(task.phase.label)")
+                            Text("\(label) · \(l10n.phaseLabel(task.phase))")
                             if task.id == store.selectedTask?.id {
                                 Image(systemName: "checkmark")
                             }
@@ -140,7 +147,7 @@ public struct WorkbenchContainerView: View {
                         .truncationMode(.tail)
                         .frame(maxWidth: 230, alignment: .leading)
                 } else {
-                    Text("No Active Task")
+                    Text(l10n.t("No Active Task", "无进行中任务"))
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                 }
@@ -150,32 +157,32 @@ public struct WorkbenchContainerView: View {
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 4.5)
-            .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
     }
 
-    private var modeToggleButton: some View {
+    private func modeToggleButton(l10n: L10n) -> some View {
         Button {
             store.togglePresentationMode()
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: store.presentationMode == .notch ? "rectangle.topthird.inset.filled" : "capsule.portrait.righthalf.filled")
                     .font(.system(size: 11))
-                Text(store.presentationMode == .notch ? "Notch" : "Pill")
+                Text(l10n.modeLabel(store.presentationMode))
                     .font(.system(size: 11, weight: .medium))
             }
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 7)
-            .padding(.vertical, 4)
-            .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .foregroundStyle(.primary.opacity(0.85))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4.5)
         }
-        .buttonStyle(.plain)
-        .help("Switch Notch ↔ Edge Pill (⌘⇧M)")
+        .buttonStyle(InteractiveSurfaceButtonStyle(cornerRadius: 6, baseFill: Color.primary.opacity(0.07)))
+        .help(l10n.t("Switch Notch ↔ Edge Pill (⌘⌥M)", "切换刘海 ↔ 吸边胶囊 (⌘⌥M)"))
     }
 
-    private var refreshButton: some View {
+    private func refreshButton(l10n: L10n) -> some View {
         Button {
             store.refreshAll()
         } label: {
@@ -188,65 +195,68 @@ public struct WorkbenchContainerView: View {
                         .font(.system(size: 11.5, weight: .medium))
                 }
             }
-            .frame(width: 24, height: 24)
-            .foregroundStyle(.secondary)
-            .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .frame(width: 26, height: 26)
+            .foregroundStyle(.primary.opacity(0.8))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(InteractiveSurfaceButtonStyle(cornerRadius: 6, baseFill: Color.primary.opacity(0.06)))
         .disabled(store.isRefreshing)
-        .help("Refresh workspace & channels")
+        .help(l10n.t("Refresh workspace & channels", "刷新工作区与频道"))
     }
 
-    private var settingsButton: some View {
+    private func settingsButton(l10n: L10n) -> some View {
         Button {
             store.toggleSettings()
         } label: {
             Image(systemName: "gearshape")
                 .font(.system(size: 11.5, weight: .medium))
-                .frame(width: 24, height: 24)
-                .foregroundStyle(store.isSettingsOpen ? Color.accentColor : Color.secondary)
-                .background(
-                    (store.isSettingsOpen ? Color.accentColor.opacity(0.14) : Color.primary.opacity(0.05)),
-                    in: RoundedRectangle(cornerRadius: 6, style: .continuous)
-                )
+                .frame(width: 26, height: 26)
+                .foregroundStyle(store.isSettingsOpen ? Color.accentColor : Color.primary.opacity(0.8))
         }
-        .buttonStyle(.plain)
-        .help("HUD Settings")
+        .buttonStyle(InteractiveSurfaceButtonStyle(
+            isSelected: store.isSettingsOpen,
+            cornerRadius: 6,
+            baseFill: Color.primary.opacity(0.06),
+            selectedFill: Color.accentColor.opacity(0.18)
+        ))
+        .help(l10n.t("HUD Settings", "HUD 设置"))
         .popover(isPresented: $store.isSettingsOpen, arrowEdge: .top) {
             SettingsPopoverView(store: store)
         }
     }
 
-    private var collapseButton: some View {
+    private func collapseButton(l10n: L10n) -> some View {
         Button {
             store.collapse()
         } label: {
             Image(systemName: "chevron.up")
                 .font(.system(size: 11, weight: .semibold))
-                .frame(width: 24, height: 24)
-                .foregroundStyle(.secondary)
-                .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .frame(width: 26, height: 26)
+                .foregroundStyle(.primary.opacity(0.8))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(InteractiveSurfaceButtonStyle(cornerRadius: 6, baseFill: Color.primary.opacity(0.06)))
         .keyboardShortcut(.escape, modifiers: [])
-        .help("Collapse Workbench (Esc)")
+        .help(l10n.t("Collapse Workbench (Esc)", "收起工作台 (Esc)"))
     }
+}
 
-    // MARK: - 4-Tab Bar
+// MARK: - Isolated 4-Tab Bar (Instant Switch, Full Hit Area)
 
-    private var tabBar: some View {
+private struct WorkbenchTabBarView: View {
+    let store: HUDStore
+
+    var body: some View {
+        let l10n = store.l10n
+
         HStack(spacing: 4) {
             ForEach(WorkbenchTab.allCases) { tab in
                 let isSelected = store.selectedTab == tab
                 Button {
-                    withAnimation(.easeInOut(duration: 0.14)) {
-                        store.selectedTab = tab
-                    }
+                    store.selectedTab = tab
                 } label: {
                     HStack(spacing: 5) {
                         Image(systemName: tab.systemImage)
                             .font(.system(size: 11, weight: isSelected ? .semibold : .regular))
-                        Text(tab.title)
+                        Text(l10n.tabTitle(tab))
                             .font(.system(size: 11.5, weight: isSelected ? .semibold : .medium))
 
                         if tab == .live && store.attentionCount > 0 {
@@ -259,25 +269,28 @@ public struct WorkbenchContainerView: View {
                         }
                     }
                     .foregroundStyle(isSelected ? Color.primary : Color.secondary)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5.5)
-                    .background(
-                        isSelected ? Color.primary.opacity(0.1) : Color.clear,
-                        in: RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    )
+                    .padding(.horizontal, 11)
+                    .padding(.vertical, 6)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(InteractiveSurfaceButtonStyle(
+                    isSelected: isSelected,
+                    cornerRadius: 7,
+                    selectedFill: Color.primary.opacity(0.13)
+                ))
             }
             Spacer()
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
     }
+}
 
-    // MARK: - Active Tab Content
+// MARK: - Active Tab Content
 
-    @ViewBuilder
-    private var tabContent: some View {
+private struct WorkbenchTabContentView: View {
+    let store: HUDStore
+
+    var body: some View {
         switch store.selectedTab {
         case .flow:
             FlowTabView(store: store)
@@ -289,35 +302,51 @@ public struct WorkbenchContainerView: View {
             HistoryTabView(store: store)
         }
     }
+}
 
-    // MARK: - Toast Overlay
+// MARK: - Isolated Toast Overlay
 
-    private func toastBanner(_ toast: StatusToast) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: toast.isError ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
-                .font(.system(size: 12))
-                .foregroundStyle(toast.isError ? Color.red : Color.green)
-            Text(toast.message)
-                .font(.system(size: 11.5, weight: .medium))
-                .foregroundStyle(.primary)
-                .lineLimit(2)
-            Spacer(minLength: 4)
-            Button {
-                store.dismissToast()
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 9.5, weight: .semibold))
-                    .foregroundStyle(.secondary)
+private struct WorkbenchToastOverlay: View {
+    let store: HUDStore
+
+    var body: some View {
+        Group {
+            if let toast = store.statusToast {
+                HStack(spacing: 8) {
+                    Image(systemName: toast.isError ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(toast.isError ? Color.red : Color.green)
+                    Text(toast.message)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                    Spacer(minLength: 4)
+                    Button {
+                        store.dismissToast()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 20, height: 20)
+                    }
+                    .buttonStyle(InteractiveSurfaceButtonStyle(cornerRadius: 4))
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(
+                    Color(nsColor: .windowBackgroundColor).opacity(0.96),
+                    in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder((toast.isError ? Color.red : Color(nsColor: .separatorColor)).opacity(0.55), lineWidth: 0.75)
+                )
+                .shadow(color: Color.black.opacity(0.18), radius: 10, x: 0, y: 4)
+                .padding(.horizontal, 14)
+                .padding(.bottom, 12)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
             }
-            .buttonStyle(.plain)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder((toast.isError ? Color.red : Color.primary).opacity(0.22), lineWidth: 0.75)
-        )
-        .shadow(color: Color.black.opacity(0.12), radius: 8, x: 0, y: 3)
+        .animation(.easeOut(duration: 0.18), value: store.statusToast)
     }
 }

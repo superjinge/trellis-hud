@@ -98,25 +98,26 @@ EOF
     echo "==> Direct swiftc build & tests passed! Binaries in $DIRECT_DIR"
 }
 
+TEST_LOG="$(mktemp)"
+trap 'rm -f "${TEST_LOG:-}"' EXIT
+
 if [[ "$CORE_ONLY" == true ]]; then
     echo "==> Running swift test --filter TrellisCoreTests (--core-only)..."
+    SWIFT_TEST_ARGS=(--filter TrellisCoreTests)
 else
     echo "==> Running swift test..."
+    SWIFT_TEST_ARGS=()
 fi
 
-TEST_LOG="$(mktemp)"
-if swift test >"$TEST_LOG" 2>&1; then
+if swift test ${SWIFT_TEST_ARGS[@]+"${SWIFT_TEST_ARGS[@]}"} >"$TEST_LOG" 2>&1; then
     cat "$TEST_LOG"
-    rm -f "$TEST_LOG"
     exit 0
 fi
 
-if grep -qE "swiftLanguageVersions|PackageDescription|Invalid manifest" "$TEST_LOG"; then
-    echo "==> Detected host CLT PackageDescription manifest bug; running direct swiftc fallback."
-    rm -f "$TEST_LOG"
+if grep -qE "swiftLanguageVersions|PackageDescription|Invalid manifest|SwiftUIMacros|macro implementation" "$TEST_LOG"; then
+    echo "==> Detected host CLT manifest/macro SDK bug; running direct swiftc fallback."
     run_direct_build_and_test
 else
     cat "$TEST_LOG" >&2
-    rm -f "$TEST_LOG"
     exit 1
 fi

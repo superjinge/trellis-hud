@@ -15,6 +15,13 @@ public struct ScreenGeometry: Sendable {
 
     public static let workbenchSize = NSSize(width: 720, height: 520)
     public static let edgePillSize = NSSize(width: 196, height: 34)
+    /// Transparent margin around the collapsed Edge Pill so its soft drop-shadow renders cleanly
+    /// without ever clipping into 4 gray rectangular corners at the borderless window edge.
+    public static let pillShadowPadding: CGFloat = 12
+    public static let edgePillWindowSize = NSSize(
+        width: edgePillSize.width + pillShadowPadding * 2,
+        height: edgePillSize.height + pillShadowPadding * 2
+    )
     public static let fallbackTopPillSize = NSSize(width: 248, height: 28)
     public static let notchEarWidth: CGFloat = 112
     public static let edgeMargin: CGFloat = 10
@@ -53,6 +60,37 @@ public struct ScreenGeometry: Sendable {
         )
     }
 
+    /// Computes the visual (non-padded) pill rect on screen for Edge Pill mode.
+    public static func visualEdgePillRect(
+        anchor: EdgeAnchor,
+        verticalRatio: Double,
+        on screen: NSScreen
+    ) -> NSRect {
+        let vf = screen.visibleFrame
+        let size = edgePillSize
+        let clampedRatio = CGFloat(min(max(verticalRatio, 0.08), 0.92))
+        let raw: NSRect
+        switch anchor {
+        case .left:
+            let x = vf.minX + edgeMargin
+            let y = vf.minY + (vf.height - size.height) * (1.0 - clampedRatio)
+            raw = NSRect(x: x, y: y, width: size.width, height: size.height)
+        case .right:
+            let x = vf.maxX - size.width - edgeMargin
+            let y = vf.minY + (vf.height - size.height) * (1.0 - clampedRatio)
+            raw = NSRect(x: x, y: y, width: size.width, height: size.height)
+        case .bottomLeft:
+            let x = vf.minX + edgeMargin + 8
+            let y = vf.minY + edgeMargin
+            raw = NSRect(x: x, y: y, width: size.width, height: size.height)
+        case .bottomRight:
+            let x = vf.maxX - size.width - edgeMargin - 8
+            let y = vf.minY + edgeMargin
+            raw = NSRect(x: x, y: y, width: size.width, height: size.height)
+        }
+        return clamp(raw, inside: vf)
+    }
+
     /// Computes collapsed panel frame for the active presentation mode.
     public static func collapsedFrame(
         mode: PresentationMode,
@@ -70,7 +108,6 @@ public struct ScreenGeometry: Sendable {
                 let y = metrics.screenFrame.maxY - height
                 return NSRect(x: x.rounded(), y: y.rounded(), width: totalWidth.rounded(), height: height.rounded())
             } else {
-                // External / non-notch display: sleek centered top pill right under menu bar
                 let size = fallbackTopPillSize
                 let x = metrics.visibleFrame.midX - size.width / 2
                 let y = metrics.visibleFrame.maxY - size.height - 4
@@ -78,27 +115,13 @@ public struct ScreenGeometry: Sendable {
             }
 
         case .edgePill:
-            let vf = screen.visibleFrame
-            let size = edgePillSize
-            let clampedRatio = CGFloat(min(max(verticalRatio, 0.08), 0.92))
-            switch anchor {
-            case .left:
-                let x = vf.minX + edgeMargin
-                let y = vf.minY + (vf.height - size.height) * (1.0 - clampedRatio)
-                return clamp(NSRect(x: x, y: y, width: size.width, height: size.height), inside: vf)
-            case .right:
-                let x = vf.maxX - size.width - edgeMargin
-                let y = vf.minY + (vf.height - size.height) * (1.0 - clampedRatio)
-                return clamp(NSRect(x: x, y: y, width: size.width, height: size.height), inside: vf)
-            case .bottomLeft:
-                let x = vf.minX + edgeMargin + 8
-                let y = vf.minY + edgeMargin
-                return clamp(NSRect(x: x, y: y, width: size.width, height: size.height), inside: vf)
-            case .bottomRight:
-                let x = vf.maxX - size.width - edgeMargin - 8
-                let y = vf.minY + edgeMargin
-                return clamp(NSRect(x: x, y: y, width: size.width, height: size.height), inside: vf)
-            }
+            let visual = visualEdgePillRect(anchor: anchor, verticalRatio: verticalRatio, on: screen)
+            return NSRect(
+                x: (visual.minX - pillShadowPadding).rounded(),
+                y: (visual.minY - pillShadowPadding).rounded(),
+                width: edgePillWindowSize.width,
+                height: edgePillWindowSize.height
+            )
         }
     }
 
@@ -134,8 +157,8 @@ public struct ScreenGeometry: Sendable {
             ))
 
         case .edgePill:
-            let pill = collapsedFrame(mode: .edgePill, anchor: anchor, verticalRatio: verticalRatio, on: screen)
-            var origin: NSPoint
+            let pill = visualEdgePillRect(anchor: anchor, verticalRatio: verticalRatio, on: screen)
+            let origin: NSPoint
             switch anchor {
             case .left:
                 origin = NSPoint(x: pill.minX, y: pill.midY - targetHeight / 2)
@@ -154,8 +177,9 @@ public struct ScreenGeometry: Sendable {
     }
 
     /// Determines the nearest magnetic `EdgeAnchor` and vertical ratio when the user finishes dragging the Edge Pill.
-    public static func snapAnchor(for pillFrame: NSRect, on screen: NSScreen) -> (EdgeAnchor, Double) {
+    public static func snapAnchor(for pillWindowFrame: NSRect, on screen: NSScreen) -> (EdgeAnchor, Double) {
         let vf = screen.visibleFrame
+        let pillFrame = pillWindowFrame.insetBy(dx: pillShadowPadding, dy: pillShadowPadding)
         let midX = pillFrame.midX
         let midY = pillFrame.midY
 

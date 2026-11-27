@@ -63,12 +63,17 @@ public struct HookInstaller: Sendable {
         return argv0
     }
 
+    public static func shellSingleQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
     public static func isOwnedCommand(_ command: String) -> Bool {
-        let stripped = command
+        let unescaped = command
+            .replacingOccurrences(of: "'\\''", with: "'")
             .replacingOccurrences(of: "\"", with: "")
             .replacingOccurrences(of: "'", with: "")
-        guard let hookRange = stripped.range(of: " hook ") else { return false }
-        let exePath = String(stripped[..<hookRange.lowerBound])
+        guard let hookRange = unescaped.range(of: " hook ") else { return false }
+        let exePath = String(unescaped[..<hookRange.lowerBound])
         let base = URL(fileURLWithPath: exePath).lastPathComponent.lowercased()
         return base == "trellis-card"
             || base == "trellis-card-hook"
@@ -106,7 +111,7 @@ public struct HookInstaller: Sendable {
     }
 
     public func hookCommand(for agent: AgentKind) -> String {
-        "\"\(hookExecutablePath)\" hook --agent \(agent.rawValue)"
+        "\(Self.shellSingleQuote(hookExecutablePath)) hook --agent \(agent.rawValue)"
     }
 
     public func status(for agent: AgentKind) -> HookInstallStatus {
@@ -196,7 +201,12 @@ public struct HookInstaller: Sendable {
         var hooks = (result["hooks"] as? [String: Any]) ?? [:]
         if uninstall {
             for (key, value) in hooks {
-                hooks[key] = removeOwnedCommands(from: value)
+                let cleaned = removeOwnedCommands(from: value)
+                if let arr = cleaned as? [Any], arr.isEmpty {
+                    hooks.removeValue(forKey: key)
+                } else {
+                    hooks[key] = cleaned
+                }
             }
             result["hooks"] = hooks
             return result
@@ -356,7 +366,15 @@ public struct HookInstaller: Sendable {
                    isOwnedCommand(cmd) {
                     continue
                 }
-                filtered.append(removeOwnedCommands(from: item))
+                let cleaned = removeOwnedCommands(from: item)
+                // Strip empty wrapper objects like `{"matcher": "*", "hooks": []}` left behind after uninstall.
+                if let cleanedDict = cleaned as? [String: Any],
+                   let nestedHooks = cleanedDict["hooks"] as? [Any],
+                   nestedHooks.isEmpty,
+                   containsOwnedCommand(item) {
+                    continue
+                }
+                filtered.append(cleaned)
             }
             return filtered
         }
@@ -373,7 +391,12 @@ public struct HookInstaller: Sendable {
         } else {
             tomlURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/config.toml")
         }
-        let existing = (try? String(contentsOf: tomlURL, encoding: .utf8)) ?? ""
+        let existing: String
+        if FileManager.default.fileExists(atPath: tomlURL.path) {
+            existing = try String(contentsOf: tomlURL, encoding: .utf8)
+        } else {
+            existing = ""
+        }
         let updated = Self.upsertCodexHooksTOML(existing)
         try writeDataAtomic(Data(updated.utf8), to: tomlURL)
     }
@@ -427,8 +450,8 @@ public struct HookInstaller: Sendable {
         try writeDataAtomic(content, to: targetPath)
     }
 
-    /// Resolves template assets across app bundles, helper-relative paths, SwiftPM bundles, and repo dev trees.
-    /// Does not rely on SwiftPM-synthesized `Bundle.module` so both `swift build` and direct `swiftc` work identically.
+    /// Resolves template assets across app bundles, helper-relative paths, and repo dev trees.
+    /// `Resources/templates` is the single source of truth.
     public static func locateTemplatesDirectory() -> URL? {
         let fm = FileManager.default
         let env = ProcessInfo.processInfo.environment
@@ -440,20 +463,15 @@ public struct HookInstaller: Sendable {
         if let resURL = Bundle.main.resourceURL {
             candidates.append(resURL.appendingPathComponent("templates", isDirectory: true))
             candidates.append(resURL.appendingPathComponent("Templates", isDirectory: true))
-            candidates.append(resURL.appendingPathComponent("TrellisHUD_TrellisCore.bundle/Contents/Resources/Templates", isDirectory: true))
-            candidates.append(resURL.appendingPathComponent("TrellisHUD_TrellisCore.bundle/Templates", isDirectory: true))
         }
         if let exeArg = ProcessInfo.processInfo.arguments.first {
             let exeURL = URL(fileURLWithPath: exeArg).standardizedFileURL.resolvingSymlinksInPath()
             let exeDir = exeURL.deletingLastPathComponent()
             // Contents/MacOS/TrellisHUD or Contents/Helpers/trellis-card-hook -> Contents/Resources/templates
             candidates.append(exeDir.deletingLastPathComponent().appendingPathComponent("Resources/templates", isDirectory: true))
-            candidates.append(exeDir.appendingPathComponent("TrellisHUD_TrellisCore.bundle/Contents/Resources/Templates", isDirectory: true))
-            candidates.append(exeDir.appendingPathComponent("TrellisHUD_TrellisCore.bundle/Templates", isDirectory: true))
         }
         let cwd = URL(fileURLWithPath: fm.currentDirectoryPath, isDirectory: true)
         candidates.append(cwd.appendingPathComponent("Resources/templates", isDirectory: true))
-        candidates.append(cwd.appendingPathComponent("Sources/TrellisCore/Templates", isDirectory: true))
 
         for dir in candidates {
             var isDir: ObjCBool = false
@@ -525,23 +543,19 @@ public struct HookInstaller: Sendable {
                 NSLocalizedDescriptionKey: "dsh CLI not found. Install DeepSeek Harness first.",
             ])
         }
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: bin)
-        proc.arguments = ["plugin", "--profile", "web"] + args
-        let outPipe = Pipe()
-        let errPipe = Pipe()
-        proc.standardOutput = outPipe
-        proc.standardError = errPipe
-        try proc.run()
-        proc.waitUntilExit()
-        let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        guard proc.terminationStatus == 0 else {
-            throw NSError(domain: "HookInstaller", code: Int(proc.terminationStatus), userInfo: [
-                NSLocalizedDescriptionKey: "dsh plugin failed: \(err)\(out)",
+        let result = SubprocessRunner.run(
+            executable: bin,
+            arguments: ["plugin", "--profile", "web"] + args,
+            environment: TaskActionRunner.augmentedEnvironment(),
+            timeoutSeconds: 15.0
+        )
+        guard result.succeeded else {
+            let reason = result.timedOut ? "timed out" : "\(result.stderr)\(result.stdout)"
+            throw NSError(domain: "HookInstaller", code: Int(result.exitCode), userInfo: [
+                NSLocalizedDescriptionKey: "dsh plugin failed: \(reason)",
             ])
         }
-        return out
+        return result.stdout
     }
 
     private func loadJSONObject(at url: URL) throws -> ([String: Any], Bool) {
@@ -563,14 +577,7 @@ public struct HookInstaller: Sendable {
     }
 
     private func writeDataAtomic(_ data: Data, to url: URL) throws {
-        let fm = FileManager.default
-        try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let tempURL = url.appendingPathExtension("tmp")
-        try data.write(to: tempURL, options: .atomic)
-        if fm.fileExists(atPath: url.path) {
-            _ = try fm.replaceItemAt(url, withItemAt: tempURL)
-        } else {
-            try fm.moveItem(at: tempURL, to: url)
-        }
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: url, options: .atomic)
     }
 }

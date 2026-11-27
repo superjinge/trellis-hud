@@ -8,9 +8,9 @@
 
 终端擅长线性执行，但在多 Agent 并行、规范门禁与跨会话记忆检索上天然存在认知盲区。**Trellis HUD** 不是静态任务贴纸，而是常驻屏幕边缘的**空间化控制面**：
 
-- **双态环境感知（Dual Ambient Modes）**：支持 **True Notch HUD**（贴合刘海屏黑区）与 **Edge-Docked Floating Pill**（贴靠屏幕左/右/左下/右下边缘的悬浮胶囊），按 **`⌘⇧M`** 实时热切换。
-- **非抢占焦点面板（Non-Activating `NSPanel`）**：悬停或点击即可展开工作台，不会打断当前 IDE 或终端焦点；按 **`⌘⇧T`** 随时唤出 / 收起工作台，**`Esc`** 快速折叠。
-- **原生 macOS 视觉体系**：采用系统 `.ultraThinMaterial` 毛玻璃与自动适配明暗模式（Light/Dark Vibrancy），无冗余花哨皮肤与伪造进度条。
+- **双态环境感知（Dual Ambient Modes）**：支持 **True Notch HUD**（贴合刘海屏黑区）与 **Edge-Docked Floating Pill**（贴靠屏幕左/右/左下/右下边缘的悬浮胶囊），按 **`⌘⌥M`** 实时热切换。
+- **非抢占焦点面板（Non-Activating `NSPanel`）**：悬停或点击即可展开工作台，不会打断当前 IDE 或终端焦点；按 **`⌘⌥T`** 随时唤出 / 收起工作台，**`Esc`** 快速折叠。
+- **原生 macOS 视觉与中英双语（Bilingual `zh-Hans` / `en`）**：采用高可读性系统 `.regularMaterial`/`.thickMaterial` 分层表面，自动适配明暗模式（Light/Dark Vibrancy），并支持在设置中一键切换 **跟随系统 / 简体中文 / English**。
 
 ---
 
@@ -21,7 +21,7 @@
 | **1. Flow** | 真实任务执行与门禁驾驶舱 | 5 阶段工作流管线（`Explore → Plan → Implement → Check → Archive`）；直接解析 `implement.md` / `prd.md` 中的真实 Markdown `- [x]` / `- [ ]` 进度；Git 脏文件与 `.trellis/spec/` `paths:` glob 覆盖率治理；时间序工具调用轨迹（保留真实文件与命令）；安全人工门禁操作栏（`Jump to Terminal` / `Validate` / `Start` / `Archive`，内置 `--no-commit --skip-branch-validation` 兼容回退）。 |
 | **2. Live** | 多 Agent 注意力收件箱 & Channel 监控 | 跨项目/多 Worktree 汇总所有活跃 Agent 会话，将 **`Waiting on You`**（权限审批 / 提问阻塞）与 **`Failed`** 置顶并支持一键跳转终端；直接解析 `~/.trellis/channels/**/events.jsonl`，实时监控 `trellis channel` 中的 Worker 生命周期（`running` / `idle` / `mid-turn` / `error`）、Threads 与消息流。 |
 | **3. Docs & Specs** | 任务文档 & 3 级 Monorepo 规范浏览器 | 原生 SwiftUI GFM 渲染器（支持 H2 折叠、代码块一键复制、表格与任务清单），快速切换 `PRD` / `Design` / `Implement` / `Research`；递归扫描 2 级与 3 级 Monorepo `.trellis/spec/<package>/<layer>/*.md`，标识空模板健康状态、引用次数与命中当前修改文件的规范数。 |
-| **4. History** | 跨平台项目记忆检索 | 统一搜索栏与来源筛选，聚合 **Archived Tasks**（按年月分组）、`.trellis/workspace/<dev>/journal-*.md` 个人工作日志，以及 **`trellis mem`** 跨平台历史会话（支持 Antigravity、Claude Code、Codex、Pi、OpenCode、Grok、Devin、ZCode）。 |
+| **4. History** | 跨平台项目记忆与归档文档阅读器 | 统一搜索栏与来源筛选，聚合 **Archived Tasks**（按年月分组，支持在面板内直接阅读已归档任务的 `PRD` / `Design` / `Implement` / `Research` 完整 Markdown 文档并一键在编辑器/Finder 中打开）、`.trellis/workspace/<dev>/journal-*.md` 个人工作日志，以及 **`trellis mem`** 跨平台历史会话（支持 Antigravity、Claude Code、Codex、Pi、OpenCode、Grok、Devin、ZCode）。 |
 
 ---
 

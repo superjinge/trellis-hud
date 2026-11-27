@@ -1,14 +1,17 @@
 import Foundation
+import os
 
 /// Runs Trellis task lifecycle scripts (`validate`, `start`, `archive`) and channel commands asynchronously
-/// without blocking the main thread, handling macOS `.app` minimal `PATH`, Python probing, ANSI stripping,
-/// and backward-compatible archive flags.
+/// without blocking the main thread, handling macOS `.app` minimal `PATH`, cached Python probing, ANSI stripping,
+/// concurrent pipe draining (`SubprocessRunner`), and backward-compatible archive flags.
 public struct TaskActionRunner: Sendable {
     public static let archiveFlagProfiles: [[String]] = [
         ["--no-commit", "--skip-branch-validation"],
         ["--no-commit"],
         [],
     ]
+
+    private static let cachedPythonLock = OSAllocatedUnfairLock<String?>(initialState: nil)
 
     public init() {}
 
@@ -82,18 +85,27 @@ public struct TaskActionRunner: Sendable {
         output.lowercased().contains("unrecognized arguments")
     }
 
+    /// Resolves and caches a working Python 3 executable once per process.
     public static func resolvePythonCommand() -> String {
+        if let cached = cachedPythonLock.withLock({ $0 }) {
+            return cached
+        }
+        let env = augmentedEnvironment()
         let candidates = [
             "/opt/homebrew/bin/python3",
             "/usr/local/bin/python3",
             "/usr/bin/python3",
         ]
-        for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
-            if probeExecutable(path, args: ["--version"]) {
-                return path
+        var resolved = "/usr/bin/python3"
+        for path in candidates {
+            if SubprocessRunner.probeExecutable(path, arguments: ["--version"], environment: env, timeoutSeconds: 3.0) {
+                resolved = path
+                break
             }
         }
-        return "/usr/bin/python3"
+        let finalResolved = resolved
+        cachedPythonLock.withLock { $0 = finalResolved }
+        return finalResolved
     }
 
     public static func resolveTrellisCLI() -> String? {
@@ -155,16 +167,16 @@ public struct TaskActionRunner: Sendable {
             let python = Self.resolvePythonCommand()
             let env = Self.augmentedEnvironment()
 
-            let finalResult = await Self.runArchiveWithFallback { flags in
+            return await Self.runArchiveWithFallback { flags in
                 await Self.runProcess(
                     action: .archive,
                     executable: python,
                     arguments: [scriptPath, "archive", taskDir] + flags,
                     cwd: projectPath,
-                    environment: env
+                    environment: env,
+                    timeoutSeconds: 30.0
                 )
             }
-            return finalResult
         } catch {
             return ActionResult(
                 success: false,
@@ -209,7 +221,8 @@ public struct TaskActionRunner: Sendable {
             executable: trellis,
             arguments: ["channel", "interrupt", channel, worker],
             cwd: projectPath,
-            environment: Self.augmentedEnvironment()
+            environment: Self.augmentedEnvironment(),
+            timeoutSeconds: 15.0
         )
     }
 
@@ -222,7 +235,8 @@ public struct TaskActionRunner: Sendable {
             executable: trellis,
             arguments: ["channel", "kill", channel, worker],
             cwd: projectPath,
-            environment: Self.augmentedEnvironment()
+            environment: Self.augmentedEnvironment(),
+            timeoutSeconds: 15.0
         )
     }
 
@@ -242,7 +256,8 @@ public struct TaskActionRunner: Sendable {
                 executable: Self.resolvePythonCommand(),
                 arguments: [scriptPath] + arguments,
                 cwd: projectPath,
-                environment: Self.augmentedEnvironment()
+                environment: Self.augmentedEnvironment(),
+                timeoutSeconds: 30.0
             )
         } catch {
             return ActionResult(
@@ -280,81 +295,44 @@ public struct TaskActionRunner: Sendable {
         return scriptURL.path
     }
 
-    private static func probeExecutable(_ path: String, args: [String]) -> Bool {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: path)
-        proc.arguments = args
-        proc.environment = augmentedEnvironment()
-        proc.standardOutput = Pipe()
-        proc.standardError = Pipe()
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-            return proc.terminationStatus == 0
-        } catch {
-            return false
-        }
-    }
-
     private static func runProcess(
         action: ActionKind,
         executable: String,
         arguments: [String],
         cwd: String,
-        environment: [String: String]
+        environment: [String: String],
+        timeoutSeconds: Double
     ) async -> ActionResult {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let start = Date()
-                let proc = Process()
-                proc.executableURL = URL(fileURLWithPath: executable)
-                proc.arguments = arguments
-                proc.currentDirectoryURL = URL(fileURLWithPath: ConfigStore.expandHome(cwd), isDirectory: true)
-                proc.environment = environment
+        let start = Date()
+        let result = await SubprocessRunner.runAsync(
+            executable: executable,
+            arguments: arguments,
+            currentDirectory: cwd,
+            environment: environment,
+            timeoutSeconds: timeoutSeconds
+        )
+        let elapsedMs = Int(Date().timeIntervalSince(start) * 1000)
+        let cleanOut = stripANSI(result.stdout).trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanErr = stripANSI(result.stderr).trimmingCharacters(in: .whitespacesAndNewlines)
 
-                let outPipe = Pipe()
-                let errPipe = Pipe()
-                proc.standardOutput = outPipe
-                proc.standardError = errPipe
-
-                do {
-                    try proc.run()
-                    let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-                    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-                    proc.waitUntilExit()
-
-                    let cleanOut = stripANSI(String(data: outData, encoding: .utf8) ?? "")
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    let cleanErr = stripANSI(String(data: errData, encoding: .utf8) ?? "")
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    let elapsedMs = Int(Date().timeIntervalSince(start) * 1000)
-                    let ok = proc.terminationStatus == 0
-                    let firstLine = (cleanErr.isEmpty ? cleanOut : cleanErr)
-                        .split(whereSeparator: \.isNewline)
-                        .map { $0.trimmingCharacters(in: .whitespaces) }
-                        .first { !$0.isEmpty } ?? (ok ? "Completed" : "Exit status \(proc.terminationStatus)")
-
-                    continuation.resume(returning: ActionResult(
-                        success: ok,
-                        action: action,
-                        exitCode: proc.terminationStatus,
-                        stdout: cleanOut,
-                        stderr: cleanErr,
-                        message: firstLine,
-                        durationMs: elapsedMs
-                    ))
-                } catch {
-                    let elapsedMs = Int(Date().timeIntervalSince(start) * 1000)
-                    continuation.resume(returning: ActionResult(
-                        success: false,
-                        action: action,
-                        exitCode: 1,
-                        stderr: error.localizedDescription,
-                        message: error.localizedDescription,
-                        durationMs: elapsedMs
-                    ))
-                }
-            }
+        let message: String
+        if result.timedOut {
+            message = "Timed out after \(Int(timeoutSeconds))s"
+        } else {
+            message = (cleanErr.isEmpty ? cleanOut : cleanErr)
+                .split(whereSeparator: \.isNewline)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .first { !$0.isEmpty } ?? (result.succeeded ? "Completed" : "Exit status \(result.exitCode)")
         }
+
+        return ActionResult(
+            success: result.succeeded,
+            action: action,
+            exitCode: result.exitCode,
+            stdout: cleanOut,
+            stderr: cleanErr,
+            message: message,
+            durationMs: elapsedMs
+        )
     }
 }

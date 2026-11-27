@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 
-/// Wire-compatible NDJSON Unix domain socket + atomic inbox queue fallback.
+/// Wire-compatible NDJSON Unix domain socket client + atomic inbox queue fallback.
 /// Matches `trellis-card/src-tauri/src/ipc.rs`.
 public enum UnixSocketProtocol {
     public static func encodeEvent(_ event: HookEvent) throws -> Data {
@@ -19,6 +19,11 @@ public enum UnixSocketProtocol {
         return try JSONDecoder().decode(HookEvent.self, from: data)
     }
 
+    /// Restricts a bound Unix domain socket to owner-only read/write (`0o600`).
+    public static func setOwnerOnlyPermissions(socketPath: String) {
+        _ = Darwin.chmod(socketPath, mode_t(0o600))
+    }
+
     /// Atomically enqueues an event JSON file into the fallback inbox directory.
     @discardableResult
     public static func enqueue(_ event: HookEvent, queueDir: URL) -> Bool {
@@ -34,13 +39,10 @@ public enum UnixSocketProtocol {
         let nonce = UInt32.random(in: 0...UInt32.max)
         let fileName = "\(nanos)-\(pid)-\(nonce).json"
         let targetURL = queueDir.appendingPathComponent(fileName, isDirectory: false)
-        let tempURL = targetURL.appendingPathExtension("tmp")
         do {
-            try data.write(to: tempURL, options: .atomic)
-            try fm.moveItem(at: tempURL, to: targetURL)
+            try data.write(to: targetURL, options: .atomic)
             return true
         } catch {
-            try? fm.removeItem(at: tempURL)
             return false
         }
     }
@@ -124,7 +126,7 @@ public enum UnixSocketProtocol {
         return events
     }
 
-    fileprivate static func makeSockAddrUn(path: String) -> sockaddr_un? {
+    private static func makeSockAddrUn(path: String) -> sockaddr_un? {
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
         let utf8 = Array(path.utf8)
@@ -137,121 +139,5 @@ public enum UnixSocketProtocol {
             buf[utf8.count] = 0
         }
         return addr
-    }
-}
-
-/// POSIX AF_UNIX stream socket listener for receiving real-time `HookEvent` lines.
-public final class UnixSocketServer: @unchecked Sendable {
-    public let socketPath: String
-    private let queue = DispatchQueue(label: "com.superjinge.trellis-hud.unix-socket-server", qos: .userInitiated)
-    private let lock = NSLock()
-    private var listenFD: Int32 = -1
-    private var isRunning = false
-
-    public init(socketPath: String) {
-        self.socketPath = socketPath
-    }
-
-    deinit {
-        stop()
-    }
-
-    public func start(onEvent: @escaping @Sendable (HookEvent) -> Void) throws {
-        lock.lock()
-        if isRunning {
-            lock.unlock()
-            return
-        }
-
-        let parent = URL(fileURLWithPath: socketPath).deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
-        Darwin.unlink(socketPath)
-
-        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else {
-            lock.unlock()
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-        }
-
-        guard var addr = UnixSocketProtocol.makeSockAddrUn(path: socketPath) else {
-            Darwin.close(fd)
-            lock.unlock()
-            throw POSIXError(.ENAMETOOLONG)
-        }
-
-        let bindResult = withUnsafePointer(to: &addr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
-                Darwin.bind(fd, sockPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
-            }
-        }
-        guard bindResult == 0 else {
-            let err = errno
-            Darwin.close(fd)
-            lock.unlock()
-            throw POSIXError(POSIXErrorCode(rawValue: err) ?? .EADDRINUSE)
-        }
-
-        guard Darwin.listen(fd, 64) == 0 else {
-            let err = errno
-            Darwin.close(fd)
-            Darwin.unlink(socketPath)
-            lock.unlock()
-            throw POSIXError(POSIXErrorCode(rawValue: err) ?? .EIO)
-        }
-
-        self.listenFD = fd
-        self.isRunning = true
-        lock.unlock()
-
-        queue.async { [weak self] in
-            self?.acceptLoop(fd: fd, onEvent: onEvent)
-        }
-    }
-
-    public func stop() {
-        lock.lock()
-        let fd = listenFD
-        listenFD = -1
-        isRunning = false
-        lock.unlock()
-
-        if fd >= 0 {
-            Darwin.shutdown(fd, SHUT_RDWR)
-            Darwin.close(fd)
-        }
-        Darwin.unlink(socketPath)
-    }
-
-    private func acceptLoop(fd: Int32, onEvent: @escaping @Sendable (HookEvent) -> Void) {
-        while true {
-            let clientFD = Darwin.accept(fd, nil, nil)
-            if clientFD < 0 {
-                lock.lock()
-                let running = isRunning
-                lock.unlock()
-                if !running || errno == EBADF || errno == EINVAL {
-                    break
-                }
-                continue
-            }
-            handleClient(clientFD: clientFD, onEvent: onEvent)
-            Darwin.close(clientFD)
-        }
-    }
-
-    private func handleClient(clientFD: Int32, onEvent: @Sendable (HookEvent) -> Void) {
-        var buffer = Data()
-        var chunk = [UInt8](repeating: 0, count: 4096)
-        while true {
-            let n = Darwin.read(clientFD, &chunk, chunk.count)
-            if n <= 0 { break }
-            buffer.append(contentsOf: chunk[0..<n])
-        }
-        guard let text = String(data: buffer, encoding: .utf8) else { return }
-        for line in text.split(whereSeparator: \.isNewline) {
-            if let event = try? UnixSocketProtocol.decodeEvent(String(line)) {
-                onEvent(event)
-            }
-        }
     }
 }

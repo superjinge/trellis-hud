@@ -20,9 +20,9 @@ public struct SpecGovernanceReport: Sendable, Codable, Equatable {
 /// Recursively scans `.trellis/spec/**/*.md` at any depth (supporting 2-level and 3-level monorepos),
 /// captures lightweight git status/worktree state, and matches actual git-modified files against spec `paths:` globs.
 public enum SpecAndGitAnalyzer: Sendable {
-    // MARK: - Glob Matching (`*`, `**`, `?`)
+    // MARK: - Glob Matching (`*`, `**`, `?`, `{a,b}`)
 
-    /// Matches a POSIX-normalized relative path against a glob pattern supporting `*`, `**`, and `?`.
+    /// Matches a POSIX-normalized relative path against a glob pattern supporting `*`, `**`, `?`, and `{a,b}` braces.
     public static func matchesGlob(pattern: String, path: String) -> Bool {
         let normPattern = normalizeRelPath(pattern)
         let normPath = normalizeRelPath(path)
@@ -46,8 +46,7 @@ public enum SpecAndGitAnalyzer: Sendable {
         modifiedFiles: [String] = [],
         referencedSpecPaths: [String] = []
     ) -> [SpecDocument] {
-        let normalizedProject = URL(fileURLWithPath: (projectPath as NSString).expandingTildeInPath)
-            .standardizedFileURL.path
+        let normalizedProject = ConfigStore.normalizePath(projectPath)
         let specRoot = (normalizedProject as NSString).appendingPathComponent(".trellis/spec")
         let fm = FileManager.default
 
@@ -56,7 +55,6 @@ public enum SpecAndGitAnalyzer: Sendable {
             return []
         }
 
-        // Count task references to each spec path (normalized both with and without `.trellis/spec/`).
         var refCounts: [String: Int] = [:]
         for rawRef in referencedSpecPaths {
             let norm = normalizeRelPath(rawRef)
@@ -155,16 +153,15 @@ public enum SpecAndGitAnalyzer: Sendable {
     // MARK: - Lightweight Git Status & Worktree Capture
 
     /// Captures branch, ahead/behind, worktree status, and dirty files for `projectPath`.
-    /// Never blocks indefinitely (enforces `timeoutSeconds`) and returns a safe empty snapshot for non-git dirs.
+    /// Uses deadlock-free `SubprocessRunner` and `-c core.quotepath=false` so UTF-8/CJK paths stay unescaped.
     public static func captureGitStatus(
         projectPath: String,
         timeoutSeconds: Double = 3.0
     ) -> GitStatusSnapshot {
-        let normalized = URL(fileURLWithPath: (projectPath as NSString).expandingTildeInPath)
-            .standardizedFileURL.path
+        let normalized = ConfigStore.normalizePath(projectPath)
 
         guard let porcelain = runGit(
-            args: ["status", "--porcelain=v1", "--branch"],
+            args: ["-c", "core.quotepath=false", "status", "--porcelain=v1", "--branch"],
             cwd: normalized,
             timeoutSeconds: timeoutSeconds
         ) else {
@@ -194,7 +191,6 @@ public enum SpecAndGitAnalyzer: Sendable {
             }
         }
 
-        // Fallback branch check for repos with zero commits or detached HEAD
         if branch == nil {
             if let revBranch = runGit(
                 args: ["rev-parse", "--abbrev-ref", "HEAD"],
@@ -209,9 +205,8 @@ public enum SpecAndGitAnalyzer: Sendable {
             }
         }
 
-        // Also union with `git diff --name-only` in case of submodule/edge entries
         if let diffNames = runGit(
-            args: ["diff", "--name-only"],
+            args: ["-c", "core.quotepath=false", "diff", "--name-only"],
             cwd: normalized,
             timeoutSeconds: timeoutSeconds
         ) {
@@ -324,15 +319,17 @@ public enum SpecAndGitAnalyzer: Sendable {
     }
 
     private static func globToRegex(_ pattern: String) -> String {
-        var regex = "^"
-        let chars = Array(pattern)
+        "^\(globSegmentToRegex(Array(pattern)))$"
+    }
+
+    private static func globSegmentToRegex(_ chars: [Character]) -> String {
+        var regex = ""
         var i = 0
 
         while i < chars.count {
             let c = chars[i]
             if c == "*" {
                 if i + 1 < chars.count && chars[i + 1] == "*" {
-                    // Handle `**/` matching zero or more directory levels
                     if i + 2 < chars.count && chars[i + 2] == "/" {
                         regex += "(?:.*/)?"
                         i += 3
@@ -347,7 +344,18 @@ public enum SpecAndGitAnalyzer: Sendable {
             } else if c == "?" {
                 regex += "[^/]"
                 i += 1
-            } else if ".+^${}()|[]\\".contains(c) {
+            } else if c == "{" {
+                if let closeIdx = findMatchingBrace(in: chars, from: i) {
+                    let inner = Array(chars[(i + 1)..<closeIdx])
+                    let alternatives = splitTopLevelBraceAlternatives(inner)
+                    let rendered = alternatives.map { globSegmentToRegex($0) }.joined(separator: "|")
+                    regex += "(?:\(rendered))"
+                    i = closeIdx + 1
+                } else {
+                    regex += "\\{"
+                    i += 1
+                }
+            } else if ".+^$()|[]\\}".contains(c) {
                 regex += "\\\(c)"
                 i += 1
             } else {
@@ -356,8 +364,41 @@ public enum SpecAndGitAnalyzer: Sendable {
             }
         }
 
-        regex += "$"
         return regex
+    }
+
+    private static func findMatchingBrace(in chars: [Character], from openIndex: Int) -> Int? {
+        var depth = 0
+        for idx in openIndex..<chars.count {
+            if chars[idx] == "{" { depth += 1 }
+            else if chars[idx] == "}" {
+                depth -= 1
+                if depth == 0 { return idx }
+            }
+        }
+        return nil
+    }
+
+    private static func splitTopLevelBraceAlternatives(_ chars: [Character]) -> [[Character]] {
+        var result: [[Character]] = []
+        var current: [Character] = []
+        var depth = 0
+        for ch in chars {
+            if ch == "{" {
+                depth += 1
+                current.append(ch)
+            } else if ch == "}" {
+                depth = max(0, depth - 1)
+                current.append(ch)
+            } else if ch == "," && depth == 0 {
+                result.append(current)
+                current = []
+            } else {
+                current.append(ch)
+            }
+        }
+        result.append(current)
+        return result
     }
 
     private static func normalizeRelPath(_ path: String) -> String {
@@ -470,7 +511,6 @@ public enum SpecAndGitAnalyzer: Sendable {
     }
 
     private static func detectWorktree(projectPath: String, timeoutSeconds: Double) -> (Bool, String?) {
-        // Fast filesystem check: linked git worktrees have a `.git` FILE (containing `gitdir: ...`) instead of a directory.
         let dotGit = (projectPath as NSString).appendingPathComponent(".git")
         var isDir: ObjCBool = false
         if FileManager.default.fileExists(atPath: dotGit, isDirectory: &isDir), !isDir.boolValue {
@@ -495,36 +535,12 @@ public enum SpecAndGitAnalyzer: Sendable {
     }
 
     private static func runGit(args: [String], cwd: String, timeoutSeconds: Double) -> String? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = args
-        process.currentDirectoryURL = URL(fileURLWithPath: cwd, isDirectory: true)
-
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
-        let semaphore = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in
-            semaphore.signal()
-        }
-
-        do {
-            try process.run()
-        } catch {
-            return nil
-        }
-
-        let waitResult = semaphore.wait(timeout: .now() + timeoutSeconds)
-        if waitResult == .timedOut {
-            process.terminate()
-            _ = semaphore.wait(timeout: .now() + 0.5)
-            return nil
-        }
-
-        guard process.terminationStatus == 0 else { return nil }
-        let data = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        return String(data: data, encoding: .utf8)
+        let result = SubprocessRunner.run(
+            executable: "/usr/bin/git",
+            arguments: args,
+            currentDirectory: cwd,
+            timeoutSeconds: timeoutSeconds
+        )
+        return result.succeeded ? result.stdout : nil
     }
 }

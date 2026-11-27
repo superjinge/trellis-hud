@@ -29,7 +29,7 @@ public enum TerminalJumper {
 
         for bundleId in orderedBundles {
             if let app = running.first(where: { $0.bundleIdentifier == bundleId && !$0.isTerminated }) {
-                app.activate(options: [.activateAllWindows])
+                app.activate()
                 return app.localizedName ?? bundleId
             }
         }
@@ -41,14 +41,14 @@ public enum TerminalJumper {
                 if let app = running.first(where: {
                     ($0.localizedName?.localizedCaseInsensitiveContains(hint) ?? false) && !$0.isTerminated
                 }) {
-                    app.activate(options: [.activateAllWindows])
+                    app.activate()
                     return app.localizedName ?? hint
                 }
             }
         }
 
-        // Fallback: open project directory in Terminal.app if nothing matched
-        if let projectPath {
+        // Fallback: open existing project directory in Terminal.app if nothing matched
+        if let projectPath, FileManager.default.fileExists(atPath: projectPath) {
             let url = URL(fileURLWithPath: projectPath)
             if let terminalURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") {
                 let config = NSWorkspace.OpenConfiguration()

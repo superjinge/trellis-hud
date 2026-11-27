@@ -39,14 +39,20 @@ function findCardBin(): string {
           join(home, ".local", "bin", "trellis-card.exe"),
         ]
       : [
+          "/Applications/TrellisHUD.app/Contents/Helpers/trellis-card-hook",
+          join(home, "Applications", "TrellisHUD.app", "Contents", "Helpers", "trellis-card-hook"),
+          join(home, ".local", "bin", "trellis-card-hook"),
+          "/usr/local/bin/trellis-card-hook",
+          "/opt/homebrew/bin/trellis-card-hook",
           join(home, ".local", "bin", "trellis-card"),
           "/usr/local/bin/trellis-card",
           "/opt/homebrew/bin/trellis-card",
         ]),
-    "trellis-card", // resolve on PATH
+    "trellis-card-hook", // resolve on PATH
+    "trellis-card", // legacy fallback on PATH
   ].filter(Boolean) as string[];
   for (const c of candidates) {
-    if (c !== "trellis-card") {
+    if (c !== "trellis-card" && c !== "trellis-card-hook") {
       try {
         if (existsSync(c)) return c;
       } catch {
@@ -54,7 +60,7 @@ function findCardBin(): string {
       }
     }
   }
-  return "trellis-card";
+  return "trellis-card-hook";
 }
 
 let cardBin: string | null = null;

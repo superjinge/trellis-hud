@@ -9,6 +9,24 @@ public struct SessionRegistry: Sendable {
     public var maxGlobalActivities: Int
     public var maxSessionActivities: Int
 
+    private static let exactTerminalEvents: Set<String> = [
+        "stop",
+        "sessionend",
+        "session_end",
+        "session.end",
+        "idle",
+        "completed",
+        "done",
+        "ended",
+    ]
+
+    private static let terminalSuffixes: [String] = [
+        ".idle", "_idle", "-idle",
+        ".completed", "_completed", "-completed",
+        ".done", "_done", "-done",
+        ".ended", "_ended", "-ended",
+    ]
+
     public init(
         activeTimeoutSeconds: TimeInterval = 300,
         registeredTimeoutSeconds: TimeInterval = 90,
@@ -31,11 +49,12 @@ public struct SessionRegistry: Sendable {
         let isTerminal = Self.isTerminalEvent(lowerEvent)
         let derivedStatus = Self.deriveStatus(lowerEvent: lowerEvent, isTerminal: isTerminal)
         let eventDate = Date(timeIntervalSince1970: TimeInterval(event.timestamp))
+        let normalizedProject = event.project.isEmpty ? "" : ConfigStore.normalizePath(event.project)
 
         var session = sessions[event.sessionId] ?? AgentSessionState(
             sessionId: event.sessionId,
             agent: event.agent,
-            projectPath: event.project,
+            projectPath: normalizedProject,
             taskId: event.taskId,
             status: .idle,
             eventName: event.eventName,
@@ -50,8 +69,8 @@ public struct SessionRegistry: Sendable {
         if session.agent == .unknown && event.agent != .unknown {
             session.agent = event.agent
         }
-        if !event.project.isEmpty {
-            session.projectPath = event.project
+        if !normalizedProject.isEmpty {
+            session.projectPath = normalizedProject
         }
         if let taskId = event.taskId, !taskId.isEmpty {
             session.taskId = taskId
@@ -86,30 +105,41 @@ public struct SessionRegistry: Sendable {
         return true
     }
 
-    public mutating func prune(now: Date = Date()) {
+    /// Prunes expired sessions and marks quiet active sessions as `.stale`.
+    /// Returns `true` if any session was modified or removed.
+    @discardableResult
+    public mutating func prune(now: Date = Date()) -> Bool {
+        var changed = false
         var next: [String: AgentSessionState] = [:]
+        next.reserveCapacity(sessions.count)
         for (id, var session) in sessions {
             let age = max(0, now.timeIntervalSince(session.updatedAt))
             switch session.status {
             case .working, .waitingPermission, .waitingQuestion, .failed:
                 if age > activeTimeoutSeconds {
                     session.status = .stale
+                    changed = true
                 }
                 next[id] = session
             case .idle, .done, .stale:
                 if age <= registeredTimeoutSeconds {
                     next[id] = session
+                } else {
+                    changed = true
                 }
             }
         }
-        sessions = next
+        if changed {
+            sessions = next
+        }
+        return changed
     }
 
     public func latestSession(forProject projectPath: String, taskId: String, dir: String? = nil) -> AgentSessionState? {
-        let normalizedProject = ConfigStore.normalizePath(projectPath).lowercased()
+        let targetKey = Self.canonicalPathKey(projectPath)
         return sessions.values
             .filter { session in
-                guard ConfigStore.normalizePath(session.projectPath).lowercased() == normalizedProject else {
+                guard Self.canonicalPathKey(session.projectPath) == targetKey else {
                     return false
                 }
                 guard let sessionTask = session.taskId else { return false }
@@ -138,8 +168,8 @@ public struct SessionRegistry: Sendable {
     public func activities(limit: Int = 50, projectPath: String? = nil) -> [ActivityEntry] {
         let filtered: [ActivityEntry]
         if let projectPath {
-            let norm = ConfigStore.normalizePath(projectPath).lowercased()
-            filtered = recentActivities.filter { ConfigStore.normalizePath($0.projectPath).lowercased() == norm }
+            let targetKey = Self.canonicalPathKey(projectPath)
+            filtered = recentActivities.filter { Self.canonicalPathKey($0.projectPath) == targetKey }
         } else {
             filtered = recentActivities
         }
@@ -148,22 +178,19 @@ public struct SessionRegistry: Sendable {
 
     // MARK: - Classification Helpers
 
-    private static func isTerminalEvent(_ lower: String) -> Bool {
-        lower == "stop"
-            || lower == "sessionend"
-            || lower == "session_end"
-            || lower.hasSuffix(".idle")
-            || lower.hasSuffix("_idle")
-            || lower.hasSuffix("idle")
-            || lower.hasSuffix(".completed")
-            || lower.hasSuffix("_completed")
-            || lower.hasSuffix("completed")
-            || lower.hasSuffix(".done")
-            || lower.hasSuffix("_done")
-            || lower.hasSuffix("done")
-            || lower.hasSuffix(".ended")
-            || lower.hasSuffix("_ended")
-            || lower.hasSuffix("ended")
+    private static func canonicalPathKey(_ raw: String) -> String {
+        var trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        while trimmed.count > 1 && trimmed.hasSuffix("/") {
+            trimmed.removeLast()
+        }
+        return trimmed.lowercased()
+    }
+
+    public static func isTerminalEvent(_ lower: String) -> Bool {
+        if exactTerminalEvents.contains(lower) {
+            return true
+        }
+        return terminalSuffixes.contains { lower.hasSuffix($0) }
     }
 
     private static func deriveStatus(lowerEvent: String, isTerminal: Bool) -> RuntimeStatus {

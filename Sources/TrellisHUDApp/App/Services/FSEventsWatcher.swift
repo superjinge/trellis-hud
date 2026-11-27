@@ -11,6 +11,7 @@ public final class FSEventsWatcher: @unchecked Sendable {
     }
 
     private let queue = DispatchQueue(label: "com.superjinge.trellis-hud.fsevents", qos: .utility)
+    private let queueKey = DispatchSpecificKey<UInt8>()
     private let debounceInterval: TimeInterval
     private let onChange: @Sendable (ChangeKind) -> Void
 
@@ -30,6 +31,7 @@ public final class FSEventsWatcher: @unchecked Sendable {
             ?? FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent(".trellis/channels").path
         self.onChange = onChange
+        self.queue.setSpecific(key: queueKey, value: 1)
     }
 
     deinit {
@@ -44,7 +46,6 @@ public final class FSEventsWatcher: @unchecked Sendable {
             if FileManager.default.fileExists(atPath: self.channelsRoot) {
                 desired.insert(self.channelsRoot)
             } else {
-                // Watch ~/.trellis so channel creation is discovered automatically
                 let homeTrellis = FileManager.default.homeDirectoryForCurrentUser
                     .appendingPathComponent(".trellis").path
                 if FileManager.default.fileExists(atPath: homeTrellis) {
@@ -58,13 +59,22 @@ public final class FSEventsWatcher: @unchecked Sendable {
         }
     }
 
+    /// Safe to invoke from any queue, including `deinit` triggered on `self.queue` (prevents `queue.sync` deadlock).
     public func stop() {
-        queue.sync {
-            pendingDebounce?.cancel()
-            pendingDebounce = nil
-            pendingKind = nil
-            tearDownStreamLocked()
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            stopLocked()
+        } else {
+            queue.sync {
+                stopLocked()
+            }
         }
+    }
+
+    private func stopLocked() {
+        pendingDebounce?.cancel()
+        pendingDebounce = nil
+        pendingKind = nil
+        tearDownStreamLocked()
     }
 
     private func tearDownStreamLocked() {
@@ -107,6 +117,7 @@ public final class FSEventsWatcher: @unchecked Sendable {
             kFSEventStreamCreateFlagUseCFTypes
                 | kFSEventStreamCreateFlagFileEvents
                 | kFSEventStreamCreateFlagNoDefer
+                | kFSEventStreamCreateFlagIgnoreSelf
         )
 
         guard let stream = FSEventStreamCreate(

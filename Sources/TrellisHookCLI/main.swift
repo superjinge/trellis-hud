@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import TrellisCore
 
@@ -30,9 +31,30 @@ enum TrellisHookCLI {
         }
     }
 
+    private static let maxStdinBytes = 2 * 1024 * 1024
+
+    private static func readBoundedStdin() -> Data {
+        var data = Data()
+        let chunkSize = 16_384
+        var buf = [UInt8](repeating: 0, count: chunkSize)
+        while data.count < maxStdinBytes {
+            let toRead = min(chunkSize, maxStdinBytes - data.count)
+            let n = Darwin.read(STDIN_FILENO, &buf, toRead)
+            if n > 0 {
+                data.append(contentsOf: buf[0..<n])
+            } else if n == 0 {
+                break
+            } else {
+                if errno == EINTR { continue }
+                break
+            }
+        }
+        return data
+    }
+
     private static func runHook(args: [String]) -> Int32 {
         let overrides = parseHookOverrides(args)
-        let stdinData = FileHandle.standardInput.readDataToEndOfFile()
+        let stdinData = readBoundedStdin()
         let input = String(data: stdinData, encoding: .utf8) ?? "{}"
 
         do {
